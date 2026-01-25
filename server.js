@@ -76,16 +76,30 @@ cron.schedule(
 
       if (!db) return;
 
+      // 1. Cleanup old activity logs
       const thirtyDaysAgo = new Date();
       thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-
       await db.collection("activitylogs").updateMany(
         { timestamp: { $lt: thirtyDaysAgo }, isActive: true },
         { $set: { isActive: false } }
       );
 
+      // 2. Rotate Daily Peaks
+      const stats = await db.collection("globalstats").findOne({ type: "daily_peak" });
+      if (stats?.today) {
+        await db.collection("globalstats").updateOne(
+          { type: "daily_peak" },
+          {
+            $set: {
+              yesterday: stats.today,
+              today: { names: "Waiting for peak vibe...", durationMs: 0 }
+            }
+          }
+        );
+      }
+
       io.emit("midnight-update", { message: "New day started" });
-      console.log("✅ Midnight cleanup done");
+      console.log("✅ Midnight rotation and cleanup done");
     } catch (err) {
       console.error("❌ Cron Error:", err);
     }
@@ -118,6 +132,32 @@ cron.schedule(
 /* =======================
    HELPERS
 ======================= */
+async function updateDailyPeak(names, durationMs) {
+  if (!db || durationMs < 1000) return; // Ignore very short glitches
+
+  try {
+    const stats = await db.collection("globalstats").findOne({ type: "daily_peak" });
+    const today = stats?.today || { names: "Waiting...", durationMs: 0 };
+
+    if (durationMs > today.durationMs) {
+      await db.collection("globalstats").updateOne(
+        { type: "daily_peak" },
+        {
+          $set: {
+            "today.names": names,
+            "today.durationMs": durationMs,
+            "today.updatedAt": new Date()
+          }
+        },
+        { upsert: true }
+      );
+      console.log(`📈 New today peak: ${names} (${Math.floor(durationMs / 60000)}m)`);
+    }
+  } catch (err) {
+    console.error("❌ updateDailyPeak Error:", err);
+  }
+}
+
 async function broadcastActiveUsers() {
   if (!db) return;
   const users = await db
@@ -196,47 +236,15 @@ app.get("/api/stats/longest-yesterday", async (req, res) => {
   if (!db) return res.status(500).json({ error: "DB not ready" });
 
   try {
-    // Current time in IST (UTC+5.5)
-    const nowIST = new Date(new Date().getTime() + (5.5 * 60 * 60 * 1000));
+    const stats = await db.collection("globalstats").findOne({ type: "daily_peak" });
+    const record = stats?.yesterday;
 
-    // Yesterday in IST
-    const yesterday = new Date(nowIST);
-    yesterday.setDate(yesterday.getDate() - 1);
-    yesterday.setHours(0, 0, 0, 0);
-
-    const today = new Date(nowIST);
-    today.setHours(0, 0, 0, 0);
-
-    // Convert back to UTC for DB query (since DB stores in UTC)
-    const startUTC = new Date(yesterday.getTime() - (5.5 * 60 * 60 * 1000));
-    const endUTC = new Date(today.getTime() - (5.5 * 60 * 60 * 1000));
-
-    let record = await db.collection("connections")
-      .find({ endTime: { $gte: startUTC, $lt: endUTC } })
-      .sort({ durationMs: -1 })
-      .limit(1)
-      .toArray();
-
-    // Fallback: If no record for specifically yesterday, show the peak from the last 7 days
-    if (record.length === 0) {
-      const weekAgo = new Date(nowIST);
-      weekAgo.setDate(weekAgo.getDate() - 7);
-      const weekAgoUTC = new Date(weekAgo.getTime() - (5.5 * 60 * 60 * 1000));
-
-      record = await db.collection("connections")
-        .find({ endTime: { $gte: weekAgoUTC } })
-        .sort({ durationMs: -1 })
-        .limit(1)
-        .toArray();
-    }
-
-    if (record.length > 0) {
-      const r = record[0];
-      const mins = Math.floor(r.durationMs / 60000);
+    if (record && record.durationMs > 0) {
+      const mins = Math.floor(record.durationMs / 60000);
       const displayDuration = mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h ${mins % 60}m`;
-      res.json({ names: r.names, duration: displayDuration });
+      res.json({ names: record.names, duration: displayDuration });
     } else {
-      res.json({ names: "Waiting for peak vibe...", duration: "0m" });
+      res.json({ names: "Ready for new legends...", duration: "0m" });
     }
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -297,33 +305,41 @@ io.on("connection", (socket) => {
 
   socket.on("send-chat-request", async ({ senderId, senderName, receiverId, receiverName, senderVibe }) => {
     const receiverSocketId = userSockets.get(receiverId);
-    console.log(`📤 Chat request from ${senderName} (${senderId}) to ${receiverId}`);
+    console.log(`📤 Chat request from ${senderName} (${senderId}) to ${receiverName || 'someone'} (${receiverId})`);
 
     // Track stats
     if (db) {
-      const sender = await db.collection("users").findOneAndUpdate(
-        { sessionId: senderId },
-        { $inc: { totalRequests: 1 } }
-      );
+      try {
+        const sender = await db.collection("users").findOneAndUpdate(
+          { sessionId: senderId },
+          { $inc: { totalRequests: 1 } }
+        );
 
-      const userDoc = sender.value || sender;
-      if (userDoc && userDoc.email) {
-        await db.collection("activitylogs").insertOne({
-          userEmail: userDoc.email,
-          type: 'REQUEST_SENT',
-          detail: `Sent vibe check to ${receiverName || receiverId} (${senderVibe || 'free'})`,
-          partnerName: receiverName,
-          vibe: senderVibe,
-          timestamp: new Date()
-        });
+        const userDoc = sender?.value || (sender?.ok ? sender : null);
+        if (userDoc && userDoc.email) {
+          await db.collection("activitylogs").insertOne({
+            userEmail: userDoc.email,
+            type: 'REQUEST_SENT',
+            detail: `Sent vibe check to ${receiverName || receiverId} (${senderVibe || 'free'})`,
+            partnerName: receiverName,
+            vibe: senderVibe,
+            timestamp: new Date()
+          });
+        } else {
+          console.log(`⚠️ Sender ${senderId} not found in users collection for logging`);
+        }
+      } catch (err) {
+        console.error("❌ Error tracking stats for request:", err.message);
       }
     }
 
     if (receiverSocketId) {
       io.to(receiverSocketId).emit("receive-chat-request", { senderId, senderName });
       socket.emit("request-sent-success");
+      console.log(`✅ Request delivered to ${receiverId}`);
     } else {
-      console.log(`❌ Receiver ${receiverId} not found`);
+      console.log(`❌ Receiver ${receiverId} not found in active sockets`);
+      socket.emit("request-failed", { message: "User is no longer online (stale session)" });
     }
   });
 
@@ -426,8 +442,11 @@ io.on("connection", (socket) => {
     if (roomInfo) {
       const durationMs = new Date() - roomInfo.startTime;
       if (db) {
+        const names = Object.values(roomInfo.names).join(" & ");
+        await updateDailyPeak(names, durationMs);
+
         await db.collection("connections").insertOne({
-          names: Object.values(roomInfo.names).join(" & "),
+          names,
           durationMs,
           endTime: new Date()
         });
@@ -505,8 +524,11 @@ io.on("connection", (socket) => {
         if (roomInfo) {
           const durationMs = new Date() - roomInfo.startTime;
           if (db) {
+            const names = Object.values(roomInfo.names).join(" & ");
+            await updateDailyPeak(names, durationMs);
+
             await db.collection("connections").insertOne({
-              names: Object.values(roomInfo.names).join(" & "),
+              names,
               durationMs,
               endTime: new Date()
             });
