@@ -48,10 +48,14 @@ This file explains the "brain" of the FreeNow platform, focusing on the server-s
 - **Mechanism**: Atomic Increments.
 - **How it works**: Instead of re-calculating everything every time, the server uses `$inc` in MongoDB to count connections as they happen. This makes the "Counter" on the landing page extremely fast and efficient, even with thousands of users.
 
-### 5. Stale Session Cleanup
+### 5. Real-time Pulse APIs (`/activeusers` & `/active-conversations`)
+- **Mechanism**: State Reflection.
+- **How it works**: The backend now provides dedicated endpoints to fetch both matched pairs and individual online users. Combined with the `users-update` socket event, this ensures the Landing Page map is always populated with the correct number of blinking pulses.
+
+### 6. Stale Session & Grace Cleanup
 - **Safety Net**: A background logic that automatically marks any chat as "Inactive" if it hasn't seen any movement or if both users are detected as offline. This prevents "Ghost" names from appearing in the Talking Now section.
 
 ---
 
 ## 🏠 Project Philosophy: "End-to-End Vibe Security"
-- The backend is designed with "Privacy by Design." Conversations are ephemeral; once a room is closed and the activity log is finalized, the messages (which are never stored in the database for long-term) vanish from memory, reflecting the "FreeNow" spirit of living in the moment.
+- The backend is designed with "Privacy by Design." Conversations are ephemeral; once a room is closed and the activity log is finalized, the messages (including incoming Snapshot media payloads) vanish from memory, reflecting the "FreeNow" spirit of living in the moment. The socket architecture is transparent, allowing for complex media types without compromising server speed.

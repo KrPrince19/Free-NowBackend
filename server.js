@@ -73,10 +73,9 @@ cron.schedule(
   async () => {
     try {
       console.log("🕛 Midnight Cron Running");
-
       if (!db) return;
 
-      // 1. Cleanup old activity logs
+      // 1. Cleanup old activity logs (30 days)
       const thirtyDaysAgo = new Date();
       thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
       await db.collection("activitylogs").updateMany(
@@ -84,21 +83,9 @@ cron.schedule(
         { $set: { isActive: false } }
       );
 
-      // 2. Rotate Daily Peaks
-      const stats = await db.collection("globalstats").findOne({ type: "daily_peak" });
-      if (stats?.today) {
-        await db.collection("globalstats").updateOne(
-          { type: "daily_peak" },
-          {
-            $set: {
-              yesterday: stats.today,
-              today: { names: "Waiting for peak vibe...", durationMs: 0 }
-            }
-          }
-        );
-      }
+      // 2. Perform rotation
+      await rotateDailyStatsIfNeeded();
 
-      io.emit("midnight-update", { message: "New day started" });
       console.log("✅ Midnight rotation and cleanup done");
     } catch (err) {
       console.error("❌ Cron Error:", err);
@@ -132,6 +119,43 @@ cron.schedule(
 /* =======================
    HELPERS
 ======================= */
+async function rotateDailyStatsIfNeeded() {
+  if (!db) return;
+  try {
+    const stats = await db.collection("globalstats").findOne({ type: "daily_peak" });
+    const now = new Date();
+    // Using IST date string for comparison
+    const todayStr = now.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+
+    const lastRotation = stats?.lastRotationDate;
+
+    if (lastRotation !== todayStr) {
+      console.log(`🔄 Rotating stats: Last rotation was ${lastRotation || 'never'}, today is ${todayStr}`);
+
+      const yesterdayData = stats?.today || { names: "Waiting for peak vibe...", durationMs: 0 };
+
+      await db.collection("globalstats").updateOne(
+        { type: "daily_peak" },
+        {
+          $set: {
+            yesterday: yesterdayData,
+            today: { names: "Waiting for peak vibe...", durationMs: 0 },
+            lastRotationDate: todayStr
+          }
+        },
+        { upsert: true }
+      );
+
+      io.emit("midnight-update", { message: "Stats rotated" });
+      console.log("✅ Rotation completed successfully");
+    } else {
+      console.log("📅 Stats are already up to date for today.");
+    }
+  } catch (err) {
+    console.error("❌ Error in rotateDailyStatsIfNeeded:", err);
+  }
+}
+
 async function updateDailyPeak(names, durationMs) {
   if (!db || durationMs < 1000) return; // Ignore very short glitches
 
@@ -418,11 +442,12 @@ io.on("connection", (socket) => {
     socket.to(roomId).emit("partner-stop-typing");
   });
 
-  socket.on("send-private-message", ({ roomId, message, senderName }) => {
+  socket.on("send-private-message", ({ roomId, message, senderName, type }) => {
     const msg = {
       id: Date.now().toString(),
       text: message,
       sender: senderName,
+      type: type || 'text',
       time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       timestamp: new Date()
     };
@@ -514,19 +539,23 @@ io.on("connection", (socket) => {
     console.log("❌ Socket disconnected:", socket.id);
     const sessionId = socket.sessionId;
 
-    // Grace Period for Disconnection (5 seconds)
-    if (socket.currentRoom && sessionId) {
-      console.log(`⏳ Starting 5s grace period for ${sessionId}`);
-      const timeout = setTimeout(async () => {
-        console.log(`🚨 Grace period expired for ${sessionId}`);
+    if (!sessionId) return;
 
+    // Grace Period for ALL Disconnections (5 seconds)
+    // Prevents vanishing on page refresh
+    console.log(`⏳ Starting 5s grace period for ${sessionId}`);
+
+    const timeout = setTimeout(async () => {
+      console.log(`🚨 Grace period expired for ${sessionId}`);
+
+      // Handle room cleanup if they were in a chat
+      if (socket.currentRoom) {
         const roomInfo = activeRooms.get(socket.currentRoom);
         if (roomInfo) {
           const durationMs = new Date() - roomInfo.startTime;
           if (db) {
             const names = Object.values(roomInfo.names).join(" & ");
             await updateDailyPeak(names, durationMs);
-
             await db.collection("connections").insertOne({
               names,
               durationMs,
@@ -534,42 +563,38 @@ io.on("connection", (socket) => {
             });
           }
         }
-
         socket.to(socket.currentRoom).emit("partner-left", { senderName: socket.senderName });
         activeRooms.delete(socket.currentRoom);
-        userRooms.delete(sessionId);
         io.emit("conversation-ended", { roomId: socket.currentRoom });
-        pendingDisconnects.delete(sessionId);
+      }
 
-        // Perform final cleanup
-        if (db) {
-          await db.collection("users").updateOne({ sessionId }, { $set: { isFree: false } });
-          await db.collection("activeusers").deleteOne({ sessionId });
-          broadcastActiveUsers();
-        }
-      }, 5000);
-
-      pendingDisconnects.set(sessionId, timeout);
-    } else if (sessionId) {
-      // Immediate cleanup for non-chatting users
+      // Final cleanup
       userSockets.delete(sessionId);
+      userRooms.delete(sessionId);
+      pendingDisconnects.delete(sessionId);
+
       if (db) {
         await db.collection("users").updateOne({ sessionId }, { $set: { isFree: false } });
         await db.collection("activeusers").deleteOne({ sessionId });
         broadcastActiveUsers();
       }
-    }
+    }, 5000);
+
+    pendingDisconnects.set(sessionId, timeout);
   });
 });
 
 /* =======================
    START SERVER
 ======================= */
-initDB().then((success) => {
+initDB().then(async (success) => {
   if (!success) {
     console.error("🛑 Server stopped (DB required)");
     process.exit(1);
   }
+
+  // Perform startup checks/rotations
+  await rotateDailyStatsIfNeeded();
 
   server.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
