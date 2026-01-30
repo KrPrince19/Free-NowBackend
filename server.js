@@ -5,7 +5,7 @@ require("dotenv").config();
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
-const { MongoClient } = require("mongodb");
+const { MongoClient, ObjectId } = require("mongodb");
 const cors = require("cors");
 const cron = require("node-cron");
 
@@ -281,8 +281,107 @@ app.get("/api/user-stats/:email", async (req, res) => {
   const user = await db.collection("users").findOne({ email: req.params.email });
   res.json({
     totalRequests: user?.totalRequests || 0,
-    matchesMade: user?.matchesMade || 0
+    matchesMade: user?.matchesMade || 0,
+    isSuspended: user?.isSuspended || false,
+    systemWarning: user?.systemWarning || null,
+    needsUnsuspendAcknowledge: user?.needsUnsuspendAcknowledge || false
   });
+});
+
+app.post("/api/admin/users/:email/suspend", async (req, res) => {
+  if (!db) return res.status(500).json({ error: "DB not ready" });
+  try {
+    const user = await db.collection("users").findOne({ email: req.params.email });
+    const newState = !user?.isSuspended;
+
+    const updateDoc = { isSuspended: newState };
+    if (!newState) {
+      updateDoc.needsUnsuspendAcknowledge = true;
+    } else {
+      updateDoc.needsUnsuspendAcknowledge = false;
+    }
+
+    await db.collection("users").updateOne(
+      { email: req.params.email },
+      { $set: updateDoc }
+    );
+
+    // Instant suspension via Socket
+    io.emit("admin-suspension", {
+      email: req.params.email,
+      isSuspended: newState,
+      needsUnsuspendAcknowledge: !newState
+    });
+
+    console.log(`🛡️ Admin toggled suspension for ${req.params.email} to ${newState}`);
+    res.json({ success: true, isSuspended: newState });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/user-stats/:email/acknowledge-unsuspend", async (req, res) => {
+  if (!db) return res.status(500).json({ error: "DB not ready" });
+  try {
+    await db.collection("users").updateOne(
+      { email: req.params.email },
+      { $set: { needsUnsuspendAcknowledge: false } }
+    );
+    console.log(`✅ User ${req.params.email} acknowledged unsuspend warning`);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/admin/users/:email/warn", async (req, res) => {
+  if (!db) return res.status(500).json({ error: "DB not ready" });
+  const { message } = req.body;
+  try {
+    await db.collection("users").updateOne(
+      { email: req.params.email },
+      { $set: { systemWarning: message } }
+    );
+
+    // Emit instant warning if user is online
+    io.emit("admin-warning", {
+      email: req.params.email,
+      message
+    });
+
+    console.log(`⚠️ Admin sent warning to ${req.params.email}`);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/user-stats/:email/clear-warning", async (req, res) => {
+  if (!db) return res.status(500).json({ error: "DB not ready" });
+  try {
+    await db.collection("users").updateOne(
+      { email: req.params.email },
+      { $set: { systemWarning: null } }
+    );
+    console.log(`✅ User ${req.params.email} dismissed warning`);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/admin/users/:email/reset-stats", async (req, res) => {
+  if (!db) return res.status(500).json({ error: "DB not ready" });
+  try {
+    await db.collection("users").updateOne(
+      { email: req.params.email },
+      { $set: { totalRequests: 0, matchesMade: 0 } }
+    );
+    console.log(`📊 Admin reset stats for ${req.params.email}`);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post("/api/feedback", async (req, res) => {
@@ -290,13 +389,23 @@ app.post("/api/feedback", async (req, res) => {
   if (!db) return res.status(500).json({ error: "DB not ready" });
 
   try {
-    await db.collection("feedback").insertOne({
+    const feedbackDoc = {
       name,
       email,
       message,
       timestamp: new Date()
-    });
+    };
+    const result = await db.collection("feedback").insertOne(feedbackDoc);
+    const feedbackWithId = { ...feedbackDoc, _id: result.insertedId.toString() };
+
     console.log(`📩 New feedback received from ${name} (${email})`);
+
+    // Broadcast to Admin Dashboard
+    const connectedClients = io.sockets.sockets.size;
+    console.log(`📡 Broadcasting 'new-feedback' to ${connectedClients} connected clients`);
+
+    io.emit("new-feedback", feedbackWithId);
+
     res.json({ success: true });
   } catch (err) {
     console.error("❌ Feedback Save Error:", err);
@@ -315,6 +424,58 @@ app.get("/api/history/:email", async (req, res) => {
 });
 
 /* =======================
+   ADMIN API (SECURE)
+======================= */
+app.get("/api/admin/users", async (req, res) => {
+  if (!db) return res.status(500).json({ error: "DB not ready" });
+  try {
+    const users = await db.collection("users").find({}).sort({ totalRequests: -1 }).toArray();
+    res.json(users);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/admin/users/:email", async (req, res) => {
+  if (!db) return res.status(500).json({ error: "DB not ready" });
+  try {
+    await db.collection("users").deleteOne({ email: req.params.email });
+    // Also cleanup logs if necessary
+    await db.collection("activitylogs").deleteMany({ userEmail: req.params.email });
+    console.log(`🗑️ Admin deleted user: ${req.params.email}`);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/admin/feedback", async (req, res) => {
+  if (!db) return res.status(500).json({ error: "DB not ready" });
+  try {
+    const feedback = await db.collection("feedback").find({}).sort({ timestamp: -1 }).toArray();
+    res.json(feedback);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/admin/feedback/:id", async (req, res) => {
+  if (!db) return res.status(500).json({ error: "DB not ready" });
+  try {
+    const { id } = req.params;
+    await db.collection("feedback").deleteOne({ _id: new ObjectId(id) });
+    console.log(`🗑️ Admin deleted feedback ID: ${id}`);
+
+    // Broadcast deletion to all admin instances
+    io.emit("feedback-deleted", { id: id.toString() });
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* =======================
    SOCKET.IO
 ======================= */
 const requestTimers = new Map();
@@ -323,7 +484,8 @@ const userRooms = new Map(); // sessionId -> { roomId, partnerName }
 const pendingDisconnects = new Map(); // sessionId -> Timeout
 
 io.on("connection", (socket) => {
-  console.log("🔌 Socket connected:", socket.id);
+  console.log(`🔌 New Socket Connection: ${socket.id} | Origin: ${socket.handshake.headers.origin}`);
+  console.log(`📡 Total Connected Clients: ${io.engine.clientsCount}`);
   broadcastActiveUsers();
 
   socket.on("register-user", (sessionId) => {
@@ -722,7 +884,7 @@ initDB().then(async (success) => {
     console.error("❌ Failed to cleanup activeusers on startup:", err);
   }
 
-  server.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
+  server.listen(PORT, "127.0.0.1", () => {
+    console.log(`🚀 Server running on http://127.0.0.1:${PORT}`);
   });
 });
