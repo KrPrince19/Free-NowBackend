@@ -418,6 +418,16 @@ io.on("connection", (socket) => {
       userRooms.set(senderId, { roomId, partnerName: senderName });
       userRooms.set(receiverId, { roomId, partnerName: receiverName });
 
+      // Remove from active users once connected (they are no longer "available" or "online" in the general pool)
+      if (db) {
+        await db.collection("activeusers").deleteMany({ sessionId: { $in: [senderId, receiverId] } });
+        await db.collection("users").updateMany(
+          { sessionId: { $in: [senderId, receiverId] } },
+          { $set: { isFree: false } }
+        );
+        broadcastActiveUsers();
+      }
+
       // Attach data for lifecycle
       socket.currentRoom = roomId;
       socket.senderName = receiverName; // On receiver's socket, "senderName" is themselves
@@ -595,6 +605,14 @@ initDB().then(async (success) => {
 
   // Perform startup checks/rotations
   await rotateDailyStatsIfNeeded();
+
+  // 🧹 CLEAR STALE ACTIVE USERS ON STARTUP
+  try {
+    const result = await db.collection("activeusers").deleteMany({});
+    console.log(`🧹 Cleaned up ${result.deletedCount} stale active user records`);
+  } catch (err) {
+    console.error("❌ Failed to cleanup activeusers on startup:", err);
+  }
 
   server.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
