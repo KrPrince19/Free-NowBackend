@@ -285,6 +285,25 @@ app.get("/api/user-stats/:email", async (req, res) => {
   });
 });
 
+app.post("/api/feedback", async (req, res) => {
+  const { name, email, message } = req.body;
+  if (!db) return res.status(500).json({ error: "DB not ready" });
+
+  try {
+    await db.collection("feedback").insertOne({
+      name,
+      email,
+      message,
+      timestamp: new Date()
+    });
+    console.log(`📩 New feedback received from ${name} (${email})`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Feedback Save Error:", err);
+    res.status(500).json({ error: "Failed to save feedback" });
+  }
+});
+
 app.get("/api/history/:email", async (req, res) => {
   if (!db) return res.status(500).json({ error: "DB not ready" });
   const logs = await db.collection("activitylogs")

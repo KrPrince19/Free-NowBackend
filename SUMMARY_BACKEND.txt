@@ -1,63 +1,52 @@
-# FreeNow Backend - Technology & Logic Summary
+# FreeNow Backend - Implementation Summary
 
-This file explains the "brain" of the FreeNow platform, focusing on the server-side architecture, real-time communication, and data management.
-
-## 🛠️ Core Technology Stack
-
-1. **Node.js & Express.js**:
-   - The engine of the backend. It handles all API requests (like fetching stats or user lists) and serves as the bridge between the database and the frontend.
-
-2. **Socket.io (Server-Side)**:
-   - The core of the "Instant Pulse" philosophy. It manages all active connections.
-   - **Rooms**: It dynamically creates virtual "Rooms" for two users when they accept a chat, ensuring their messages are private and never leak to others.
-
-3. **MongoDB (Atlas)**:
-   - A powerful Cloud NoSQL database used to store:
-     - **Active Users**: Who is currently "Free to Vibe".
-     - **Activity Logs**: Tracking every connection, duration, and global milestone.
-     - **Long-term Stats**: Counting total connections made this month and legendary connection records.
-   - **Migration**: Recently migrated from local MongoDB Compass to a globally distributed MongoDB Atlas cluster for improved reliability and accessibility.
-
-4. **Node-Cron**:
-   - An automated task scheduler.
-   - **Midnight Cleanup**: Every night at 12:00 AM, it automatically calculates the "Longest Connection of Yesterday," resets daily limits, and clears any stale data to keep the database fast.
-
-5. **Dotenv & CORS**:
-   - **Dotenv**: Keeps sensitive data (like MongoDB URLs and API keys) safe and separate from the code.
-   - **CORS**: Allows the frontend (on port 3000) to talk safely to the backend (on port 5000).
+This file explains the technical architecture and backend logic that powers the FreeNow experience, following a structured "Implementation & Explanation" format.
 
 ---
 
-## 🧠 Smart Logic & Backend Engineering
+## 🛠️ Core Infrastructure
 
-### 1. The 5-Second Refresh Grace Period (Anti-Ghosting)
-- **Problem**: In most apps, if you refresh the page, the server thinks you "Left" and closes the chat.
-- **Solution**: A custom timeout logic in the `disconnect` handler.
-- **How it works**: When a user's socket disconnects, the server doesn't panic. It waits for **5 seconds**. If the user re-connects within that time (which happens during a refresh), the server cancels the "Close Chat" command. If they don't come back, the server then cleans up safely.
+### Implementing Node.js & Express API
+**How it is implemented**: Node.js serves as the execution environment, with Express.js managing the RESTful API endpoints. It handles critical tasks such as fetching global stats, user history, and processing feedback submissions.
 
-### 2. Real-time Synchronization
-- **Events**: `conversation-started` and `conversation-ended`.
-- **How it works**: The moment a chat begins or ends, the server broadcasts a message to EVERYONE currently on the landing page. This ensures the "Talking Now" box stays perfectly in sync across the entire globe without anyone needing to refresh their browser.
+### Implementing Socket.io (Server)
+**How it is implemented**: Socket.io manages all real-time bi-directional communication. It uses namespaces and dynamic "Rooms" to isolate conversations between matched pairs, ensuring message privacy and low-latency feature synchronization.
 
-### 3. Messaging Actions (Edit/Delete)
-- **ID Tracking**: Every message is assigned a unique, high-entropy ID (timestamp + random string).
-- **Edit Broadcast**: When an `edit-message` event arrives, the server finds everyone in that specific Room and tells their browsers to update the text for that specific ID.
-- **Delete Toggle**: Instead of deleting data from the log immediately, the server broadcasts a `message-deleted` event, allowing the frontend to show the "This message was deleted" placeholder for transparency.
-- **Bilateral Feature Sync**: The server facilitates synchronized toggles for features like the Doodle Canvas and Vibe Games, ensuring that when one user opens or closes a feature, it instantly reflects for their partner.
-- **Micro-Interaction Broadcasting**: Small interactions like emojis, reactions, and drawing movements are broadcasted with low latency to maintain a high-quality "live" feeling.
+### Implementing MongoDB Atlas (Cloud)
+**How it is implemented**: We utilize a globally distributed MongoDB Atlas cluster to store non-ephemeral data. This includes user profiles, activity logs for statistics, and feedback submissions. We use the official `mongodb` driver for high-performance atomic operations.
 
-### 4. Global Stats Engine
-- **Mechanism**: Atomic Increments.
-- **How it works**: Instead of re-calculating everything every time, the server uses `$inc` in MongoDB to count connections as they happen. This makes the "Counter" on the landing page extremely fast and efficient, even with thousands of users.
-
-### 5. Real-time Pulse APIs (`/activeusers` & `/active-conversations`)
-- **Mechanism**: State Reflection.
-- **How it works**: The backend now provides dedicated endpoints to fetch both matched pairs and individual online users. Combined with the `users-update` socket event, this ensures the Landing Page map is always populated with the correct number of blinking pulses.
-
-### 6. Stale Session & Grace Cleanup
-- **Safety Net**: A background logic that automatically marks any chat as "Inactive" if it hasn't seen any movement or if both users are detected as offline. This prevents "Ghost" names from appearing in the Talking Now section.
+### Implementing Automated Maintenance (Cron Jobs)
+**How it is implemented**: Using `node-cron`, the server runs scheduled tasks at midnight IST. These tasks rotate daily connection records, cleanup stale session logs, and reset monthly counters to keep the database optimized.
 
 ---
 
-## 🏠 Project Philosophy: "End-to-End Vibe Security"
-- The backend is designed with "Privacy by Design." Conversations are ephemeral; once a room is closed and the activity log is finalized, the messages (including incoming Snapshot media payloads) vanish from memory, reflecting the "FreeNow" spirit of living in the moment. The socket architecture is transparent, allowing for complex media types without compromising server speed.
+## 🧠 Logic & Engineering
+
+### Implementing 5-Second Refresh Grace Period (Anti-Ghosting)
+**How it is implemented**: In the socket `disconnect` handler, we implement a `setTimeout` for 5 seconds. If a new socket with the same `sessionId` connects before the timer ends, the disconnect cleanup is cancelled, allowing users to refresh pages without losing their chat rooms.
+
+### Implementing Real-Time Synchronization Logic
+**How it is implemented**: The server acts as a central hub for state changes. When a chat starts or ends, it broadcasts `conversation-started` or `conversation-ended` events to all connected clients, ensuring the landing page's "Talking Now" box is always in sync.
+
+### Implementing Message Action Broadcasting (Edit/Delete)
+**How it is implemented**: For edits and deletions, the server receives the target `messageId` and broadcasting the update to only participants in that specific room. This ensures that UI updates happen instantly for both users without storing the messages on the server.
+
+### Implementing Global Stats Engine (Atomic Increments)
+**How it is implemented**: To ensure high performance under load, we use MongoDB's `$inc` operator. This allows the server to increment connection counters and peak duration stats atomically, avoiding the need for expensive "count" queries on large datasets.
+
+### Implementing Feedback Collection Engine
+**How it is implemented**: A dedicated POST endpoint `/api/feedback` was implemented to bridge the frontend support hub with the database. It validates user input and persists feedback messages for developer review, separating it from the ephemeral chat logic.
+
+### Implementing User Feedback Response Flow
+**How it is implemented**: To reply to users, the administrator can access the `feedback` collection in the MongoDB Atlas dashboard. Since every feedback entry includes the user's email address, the administrator can respond directly via email. This maintains the platform's focus on privacy while ensuring a professional support channel.
+
+### Implementing Bilateral Feature Sync (Draw/Game)
+**How it is implemented**: State-toggle events like `draw-toggle` and `vibe-game-toggle` are broadcasted to the room. When one user opens a tool, the server tells the other client to open the same tool, ensuring both participants are always looking at the same interface.
+
+### Implementing Stale Session Cleanup (Safety Net)
+**How it is implemented**: On server startup and during idle periods, a cleanup logic runs to delete any "Active User" records whose sockets are no longer connected. This prevents "Ghost" users from appearing in the discovery pool.
+
+---
+
+## 🛡️ Security & Privacy Philosophy
+**How it is implemented**: Privacy is implemented by making the database "blind" to conversation content. Message payloads travel through memory only and are never written to disk, upholding the platform's commitment to ephemeral, trace-free communication.
