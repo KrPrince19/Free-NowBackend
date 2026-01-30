@@ -43,6 +43,8 @@ This file explains the "brain" of the FreeNow platform, focusing on the server-s
 - **ID Tracking**: Every message is assigned a unique, high-entropy ID (timestamp + random string).
 - **Edit Broadcast**: When an `edit-message` event arrives, the server finds everyone in that specific Room and tells their browsers to update the text for that specific ID.
 - **Delete Toggle**: Instead of deleting data from the log immediately, the server broadcasts a `message-deleted` event, allowing the frontend to show the "This message was deleted" placeholder for transparency.
+- **Bilateral Feature Sync**: The server facilitates synchronized toggles for features like the Doodle Canvas and Vibe Games, ensuring that when one user opens or closes a feature, it instantly reflects for their partner.
+- **Micro-Interaction Broadcasting**: Small interactions like emojis, reactions, and drawing movements are broadcasted with low latency to maintain a high-quality "live" feeling.
 
 ### 4. Global Stats Engine
 - **Mechanism**: Atomic Increments.
