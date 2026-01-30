@@ -246,6 +246,7 @@ app.get("/api/global-stats/monthly", async (req, res) => {
 });
 
 const activeRooms = new Map(); // roomId -> { participants: [], names: {}, startTime: Date }
+const activeVibeGames = new Map(); // roomId -> { round: 1, selections: { sessionId: emoji }, turnId: sessionId }
 
 app.get("/api/active-conversations", async (req, res) => {
   const rooms = Array.from(activeRooms.values()).map(r => ({
@@ -506,6 +507,94 @@ io.on("connection", (socket) => {
     if (senderSocketId) {
       io.to(senderSocketId).emit("request-rejected", { message: "Request declined" });
     }
+  });
+
+  socket.on("vibe-game-toggle", ({ roomId, isOpen }) => {
+    io.to(roomId).emit("vibe-game-status", { isOpen });
+    if (!isOpen) {
+      activeVibeGames.delete(roomId);
+      return;
+    }
+
+    if (isOpen && !activeVibeGames.has(roomId)) {
+      // Initialize game
+      const room = activeRooms.get(roomId);
+      if (room) {
+        const participantIds = Object.keys(room.names);
+        activeVibeGames.set(roomId, {
+          round: 1,
+          selections: {},
+          turnId: participantIds[0],
+          participantIds
+        });
+      }
+    }
+
+    // Always emit current state to anyone who opens the dashboard
+    if (activeVibeGames.has(roomId)) {
+      io.to(roomId).emit("vibe-game-state", activeVibeGames.get(roomId));
+    }
+  });
+
+  socket.on("vibe-emoji-select", ({ roomId, sessionId, emoji }) => {
+    const game = activeVibeGames.get(roomId);
+    if (!game) return;
+
+    const sId = socket.sessionId || sessionId; // Use socket's own session if possible
+    game.selections[sId] = emoji;
+
+    // Broadcast that someone selected (but not what they selected)
+    io.to(roomId).emit("vibe-partner-selected", { sessionId: sId });
+
+    const keys = Object.keys(game.selections);
+    if (keys.length === 2) {
+      // Both selected!
+      const isMatch = game.selections[keys[0]] === game.selections[keys[1]];
+      io.to(roomId).emit("vibe-round-result", {
+        selections: game.selections,
+        isMatch,
+        round: game.round
+      });
+
+      // Prepare next round
+      game.round += 1;
+      game.selections = {};
+      // Flip turn
+      game.turnId = game.turnId === game.participantIds[0] ? game.participantIds[1] : game.participantIds[0];
+
+      setTimeout(() => {
+        if (game.round > 5) {
+          io.to(roomId).emit("vibe-game-status", { isOpen: false, finished: true });
+          activeVibeGames.delete(roomId);
+        } else {
+          io.to(roomId).emit("vibe-game-state", game);
+        }
+      }, 3000); // 3 second delay to show result
+    }
+  });
+
+  socket.on("vibe-game-reset", ({ roomId }) => {
+    activeVibeGames.delete(roomId);
+  });
+
+  socket.on("draw-start", ({ roomId, x, y, color }) => {
+    socket.to(roomId).emit("draw-partner-start", { x, y, color });
+  });
+
+  socket.on("draw-toggle", ({ roomId, isOpen }) => {
+    io.to(roomId).emit("draw-room-toggle", { isOpen });
+  });
+
+  socket.on("draw-move", ({ roomId, x, y }) => {
+    socket.to(roomId).emit("draw-partner-move", { x, y });
+  });
+
+  socket.on("draw-clear", ({ roomId }) => {
+    io.to(roomId).emit("draw-room-clear");
+  });
+
+  socket.on("vibe-reaction", ({ roomId, messageId, emoji, x, y }) => {
+    io.to(roomId).emit("message-reaction-ribbon", { messageId, emoji, x, y });
   });
 
   socket.on("go-free", async ({ id, name, status }) => {
