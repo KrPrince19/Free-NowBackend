@@ -49,19 +49,31 @@ const io = new Server(server, {
 /* =======================
    MONGODB
 ======================= */
-const client = new MongoClient(process.env.MONGO_URI);
+const client = new MongoClient(process.env.MONGO_URI, {
+  connectTimeoutMS: 10000,
+  serverSelectionTimeoutMS: 10000,
+  socketTimeoutMS: 45000,
+  family: 4 // Force IPv4 to avoid some DNS SRV resolution issues
+});
 let db;
 
-async function initDB() {
-  try {
-    console.log("⏳ Connecting to MongoDB Atlas...");
-    await client.connect();
-    db = client.db("freeNow"); // ✅ MATCH URI DB NAME
-    console.log("✅ MongoDB Connected");
-    return true;
-  } catch (err) {
-    console.error("❌ MongoDB Connection Error:", err.message);
-    return false;
+async function initDB(retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      console.log(`⏳ Connecting to MongoDB Atlas (Attempt ${i + 1}/${retries})...`);
+      await client.connect();
+      db = client.db("freeNow");
+      console.log("✅ MongoDB Connected");
+      return true;
+    } catch (err) {
+      console.error(`❌ MongoDB Connection Attempt ${i + 1} Failed:`, err.message);
+      if (i < retries - 1) {
+        console.log("🔄 Retrying in 5 seconds...");
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      } else {
+        return false;
+      }
+    }
   }
 }
 
