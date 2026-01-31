@@ -237,6 +237,8 @@ app.post("/api/sync-user", async (req, res) => {
   );
 
   res.json({ success: true });
+  broadcastActiveUsers(); // Trigger refresh for admin and dashboard
+  io.emit("new-user-registered", { name, email, sessionId });
 });
 
 app.get("/api/global-stats/monthly", async (req, res) => {
@@ -379,6 +381,7 @@ app.post("/api/admin/users/:email/reset-stats", async (req, res) => {
     );
     console.log(`📊 Admin reset stats for ${req.params.email}`);
     res.json({ success: true });
+    io.emit("admin-stats-reset", { email: req.params.email });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -444,6 +447,7 @@ app.delete("/api/admin/users/:email", async (req, res) => {
     await db.collection("activitylogs").deleteMany({ userEmail: req.params.email });
     console.log(`🗑️ Admin deleted user: ${req.params.email}`);
     res.json({ success: true });
+    io.emit("admin-user-deleted", { email: req.params.email });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -486,6 +490,12 @@ const pendingDisconnects = new Map(); // sessionId -> Timeout
 io.on("connection", (socket) => {
   console.log(`🔌 New Socket Connection: ${socket.id} | Origin: ${socket.handshake.headers.origin}`);
   console.log(`📡 Total Connected Clients: ${io.engine.clientsCount}`);
+
+  // Track room joins for admin debugging
+  socket.onAny((event, ...args) => {
+    console.log(`📡 EVENT: ${event}`, args);
+  });
+
   broadcastActiveUsers();
 
   socket.on("register-user", (sessionId) => {
@@ -884,7 +894,7 @@ initDB().then(async (success) => {
     console.error("❌ Failed to cleanup activeusers on startup:", err);
   }
 
-  server.listen(PORT, "127.0.0.1", () => {
-    console.log(`🚀 Server running on http://127.0.0.1:${PORT}`);
+  server.listen(PORT, "0.0.0.0", () => {
+    console.log(`🚀 Server running on http://localhost:${PORT}`);
   });
 });
