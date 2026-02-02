@@ -9,6 +9,19 @@ const { MongoClient, ObjectId } = require("mongodb");
 const cors = require("cors");
 const cron = require("node-cron");
 
+const SERVER_VERSION = "6.0-ULTIMATE";
+console.log("🛠️ SERVER VERSION:", SERVER_VERSION);
+
+// Server-side deduplication cache (ClientId -> Timestamp)
+const serverSideClientCache = new Map();
+// Cleanup cache every 1 minute
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, time] of serverSideClientCache.entries()) {
+    if (now - time > 60000) serverSideClientCache.delete(id);
+  }
+}, 60000);
+
 /* =======================
    SAFETY: GLOBAL ERRORS
 ======================= */
@@ -235,22 +248,27 @@ app.post("/api/sync-user", async (req, res) => {
   const { sessionId, email, name } = req.body;
   if (!db) return res.status(500).json({ error: "DB not ready" });
 
-  await db.collection("users").updateOne(
-    { email },
-    {
-      $set: { sessionId, name, lastSeen: new Date() },
-      $setOnInsert: {
-        totalRequests: 0,
-        matchesMade: 0,
-        isFree: false
-      }
-    },
-    { upsert: true }
-  );
+  try {
+    await db.collection("users").updateOne(
+      { email },
+      {
+        $set: { sessionId, name, lastSeen: new Date() },
+        $setOnInsert: {
+          totalRequests: 0,
+          matchesMade: 0,
+          isFree: false
+        }
+      },
+      { upsert: true }
+    );
 
-  res.json({ success: true });
-  broadcastActiveUsers(); // Trigger refresh for admin and dashboard
-  io.emit("new-user-registered", { name, email, sessionId });
+    res.json({ success: true });
+    broadcastActiveUsers(); // Trigger refresh for admin and dashboard
+    io.emit("new-user-registered", { name, email, sessionId });
+  } catch (err) {
+    console.error("❌ Sync User Route Error:", err);
+    res.status(500).json({ error: "Failed to sync user" });
+  }
 });
 
 app.get("/api/global-stats/monthly", async (req, res) => {
@@ -511,6 +529,17 @@ io.on("connection", (socket) => {
   broadcastActiveUsers();
 
   socket.on("register-user", (sessionId) => {
+    // If user already has a socket, disconnect the old one to prevent duplicates
+    const oldSocketId = userSockets.get(sessionId);
+    if (oldSocketId && oldSocketId !== socket.id) {
+      console.log(`🔄 Session takeover for ${sessionId}: Disconnecting old socket ${oldSocketId}`);
+      const oldSocket = io.sockets.sockets.get(oldSocketId);
+      if (oldSocket) {
+        oldSocket.emit("force-disconnect", "New session established elsewhere");
+        oldSocket.disconnect(true);
+      }
+    }
+
     socket.sessionId = sessionId;
     userSockets.set(sessionId, socket.id);
     console.log(`✅ User registered: ${sessionId} -> ${socket.id}`);
@@ -640,11 +669,15 @@ io.on("connection", (socket) => {
         senderSocket.senderName = senderName;
       }
 
-      io.to(senderSocketId).emit("chat-started", { ...chatData, partnerName: receiverName });
-      socket.emit("chat-init-receiver", { ...chatData, partnerName: senderName });
+      try {
+        io.to(senderSocketId).emit("chat-started", { ...chatData, partnerName: receiverName });
+        socket.emit("chat-init-receiver", { ...chatData, partnerName: senderName });
 
-      io.emit("conversation-started", { roomId });
-      console.log(`🤝 Chat started between ${senderName} and ${receiverName} in room ${roomId}`);
+        io.emit("conversation-started", { roomId });
+        console.log(`🤝 Chat started between ${senderName} and ${receiverName} in room ${roomId}`);
+      } catch (err) {
+        console.error("❌ socket.emit error in accept-chat:", err);
+      }
     }
   });
 
@@ -656,15 +689,33 @@ io.on("connection", (socket) => {
     socket.to(roomId).emit("partner-stop-typing");
   });
 
-  socket.on("send-private-message", ({ roomId, message, senderName, type }) => {
+  socket.on("send-private-message", ({ roomId, message, senderName, type, clientId }) => {
+    // 1.5 ROOM VALIDATION
+    if (!activeRooms.has(roomId)) {
+      console.warn(`⚠️ [V5:BYPASS] Message attempted for non-existent room: ${roomId}`);
+      return;
+    }
+
+    // 1. SERVER-SIDE DEDUPLICATION
+    if (clientId) {
+      if (serverSideClientCache.has(clientId)) {
+        console.log(`⏭️ [V5:DUP] Server-side duplicate clientId ignored: ${clientId}`);
+        return;
+      }
+      serverSideClientCache.set(clientId, Date.now());
+    }
+
+    const timestamp = new Date();
     const msg = {
-      id: Date.now().toString(),
+      id: `${timestamp.getTime()}-${Math.random().toString(36).substr(2, 5)}`,
+      roomId: roomId,
+      clientId: clientId,
       text: message,
       sender: senderName,
       type: type || 'text',
-      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      timestamp: new Date()
+      timestamp: timestamp.toISOString()
     };
+    console.log(`💬 [V:${SERVER_VERSION}][Room ${roomId}] Msg from ${senderName}: ${type || 'text'} (ID: ${msg.id}, ClientId: ${clientId || 'UNDEFINED'})`);
     io.to(roomId).emit("new-message", msg);
   });
 
@@ -797,6 +848,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("vibe-reaction", ({ roomId, messageId, emoji, x, y }) => {
+    console.log(`💓 [SERVER:REACTION] Room ${roomId} | Msg ${messageId} | Icon ${emoji}`);
     io.to(roomId).emit("message-reaction-ribbon", { messageId, emoji, x, y });
   });
 
