@@ -224,6 +224,7 @@ async function broadcastActiveUsers() {
       id: u.sessionId,
       name: u.name,
       status: u.status,
+      isPremium: u.isPremium || false, // 💎 PREMIUM: Include for UI rings/badges
       createdAt: u.createdAt
     }))
   );
@@ -245,7 +246,8 @@ async function sendUsageUpdate(sessionId, socket) {
       const usageData = {
         requestsToday,
         goFreeToday,
-        isPremium: !!user.isPremium
+        isPremium: !!user.isPremium,
+        premiumUntil: user.premiumUntil || null
       };
 
       // Emit to specific socket if provided, OR to all sockets in the user's private room
@@ -275,6 +277,7 @@ app.get("/api/activeusers", async (req, res) => {
     id: u.sessionId,
     name: u.name,
     status: u.status,
+    isPremium: u.isPremium || false, // 💎 PREMIUM: Include for UI rings/badges
     createdAt: u.createdAt
   })));
 });
@@ -466,11 +469,68 @@ app.post("/api/admin/users/:email/premium", async (req, res) => {
     );
 
     console.log(`💎 Admin toggled premium for ${req.params.email}: ${newPremiumStatus}`);
-    res.json({ success: true, isPremium: newPremiumStatus });
 
-    // Notify the user via socket if they are online to update their UI
+    // 💰 REAL-TIME SYNC: Update lobby and notify user immediately
+    // 1. Update the active lobby directly (if user is online/free)
+    const lobbyUpdate = await db.collection("activeusers").updateOne(
+      { sessionId: user.sessionId },
+      { $set: { isPremium: newPremiumStatus } }
+    );
+    if (lobbyUpdate.modifiedCount > 0) {
+      console.log(`✅ [LOBBY-SYNC] Updated premium status for ${req.params.email} in active lobby`);
+      broadcastActiveUsers();
+    }
+
+    // 2. Notify the user's tab(s) directly via their sessionId room
+    if (user.sessionId) {
+      console.log(`📡 [SESSION-SYNC] Sending usage-update to user_${user.sessionId}`);
+      sendUsageUpdate(user.sessionId);
+    }
+
+    // 3. Global notification as backup for StatusContext listener
     io.emit("admin-premium-toggle", { email: req.params.email, isPremium: newPremiumStatus });
+
+    res.json({ success: true, isPremium: newPremiumStatus });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 💰 MOCK PAYMENT: Simulates a successful checkout for testing
+app.post("/api/mock-payment-success", async (req, res) => {
+  if (!db) return res.status(500).json({ error: "DB not ready" });
+  try {
+    const { email, sessionId } = req.body;
+    if (!email || !sessionId) return res.status(400).json({ error: "Missing email or sessionId" });
+
+    console.log(`💰 [MOCK-PAYMENT] Simulating success for: ${email}`);
+
+    // Calculate Expiry: 30 Days from now
+    const expiryDate = new Date();
+    expiryDate.setDate(expiryDate.getDate() + 30);
+
+    // 1. Update Persistent Database
+    await db.collection("users").updateOne(
+      { email },
+      { $set: { isPremium: true, premiumUntil: expiryDate } }
+    );
+
+    // 2. Update Active Lobby Cache
+    await db.collection("activeusers").updateOne(
+      { sessionId },
+      { $set: { isPremium: true } }
+    );
+
+    // 3. Real-Time Triple Sync
+    broadcastActiveUsers(); // Show 👑 to everyone
+    sendUsageUpdate(sessionId); // Show 👑 to user tabs
+
+    // Global toggle event as backup
+    io.emit("admin-premium-toggle", { email, isPremium: true, premiumUntil: expiryDate });
+
+    res.json({ success: true, message: "Welcome to Elite Status! 👑", premiumUntil: expiryDate });
+  } catch (err) {
+    console.error("❌ Mock Payment Error:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -622,6 +682,11 @@ io.on("connection", (socket) => {
     // Join a private room for this user session to sync multiple tabs
     socket.join(`user_${sessionId}`);
 
+    socket.on("usage-refresh", (sid) => {
+      console.log(`📊 [REFRESH] User ${sid} requested usage refresh`);
+      sendUsageUpdate(sid, socket);
+    });
+
     console.log(`✅ User registered: ${sessionId} -> ${socket.id} (Joined user_${sessionId})`);
 
     // Session Recovery & Grace Period Cleanup
@@ -651,14 +716,20 @@ io.on("connection", (socket) => {
     const receiverSocketId = userSockets.get(receiverId);
     console.log(`📤 Chat request from ${senderName} (${senderId}) to ${receiverName || 'someone'} (${receiverId})`);
 
-    // 💰 MONETIZATION: Check if non-premium user has exceeded 5 daily chat requests
+    // 💰 MONETIZATION: Universal limit and priority check
+    let userCheck = null;
     if (db) {
       try {
-        const user = await db.collection("users").findOne({ sessionId: senderId });
-        if (user && !user.isPremium) {
+        userCheck = await db.collection("users").findOne({ sessionId: senderId });
+
+        // 💎 PREMIUM: Bypass daily ping limits for premium accounts
+        const isPremium = userCheck?.isPremium || false;
+
+        if (!isPremium) {
           const today = new Date().toDateString();
-          if (user.lastRequestDate === today) {
-            if (user.requestsToday >= 5) {
+          if (userCheck && userCheck.lastRequestDate === today) {
+            if ((userCheck.requestsToday || 0) >= 5) {
+              console.log(`🚫 [LIMIT] User ${senderId} hit ping limit`);
               socket.emit("request-failed", {
                 message: "Daily limit reached (5 requests). Upgrade to Premium for unlimited vibing!",
                 limitReached: true
@@ -672,14 +743,10 @@ io.on("connection", (socket) => {
       }
     }
 
-    // 📊 USER METRICS: Increment total and daily request counters for analytics and limits
+    // 📊 USER METRICS: Increment total and daily request counters
     if (db) {
       try {
         const today = new Date().toDateString();
-
-        // 🛡️ CRITICAL FIX: Check if we need to reset count (new day) or increment (same day)
-        // This avoids the MongoDB "$set and $inc on the same field" error
-        const userCheck = await db.collection("users").findOne({ sessionId: senderId });
         const isNewDay = !userCheck || userCheck.lastRequestDate !== today;
 
         const updateDoc = isNewDay
@@ -688,29 +755,29 @@ io.on("connection", (socket) => {
 
         console.log(`📡 [PING] User: ${senderId} | isNewDay: ${isNewDay} | updateDoc:`, JSON.stringify(updateDoc));
 
-        const sender = await db.collection("users").findOneAndUpdate(
+        const senderResult = await db.collection("users").findOneAndUpdate(
           { sessionId: senderId },
           updateDoc,
           { returnDocument: 'after', upsert: true }
         );
 
-        console.log(`📡 [PING-SUCCESS] User: ${senderId} | NewCount: ${sender?.requestsToday || sender?.value?.requestsToday || 1}`);
+        // Standardize the result regardless of MongoDB driver version
+        const updatedUser = senderResult?.value || senderResult;
+
+        console.log(`📡 [PING-SUCCESS] User: ${senderId} | NewCount: ${updatedUser?.requestsToday || 1}`);
 
         // 💰 MONETIZATION: Emit updated counts to the sender
         sendUsageUpdate(senderId, socket);
 
-        const userDoc = sender?.value || (sender?.ok ? sender : null);
-        if (userDoc && userDoc.email) {
+        if (updatedUser && updatedUser.email) {
           await db.collection("activitylogs").insertOne({
-            userEmail: userDoc.email,
+            userEmail: updatedUser.email,
             type: 'REQUEST_SENT',
             detail: `Sent vibe check to ${receiverName || receiverId} (${senderVibe || 'free'})`,
             partnerName: receiverName,
             vibe: senderVibe,
             timestamp: new Date()
           });
-        } else {
-          console.log(`⚠️ Sender ${senderId} not found in users collection for logging`);
         }
       } catch (err) {
         console.error("❌ Error tracking stats for request:", err.message);
@@ -718,7 +785,12 @@ io.on("connection", (socket) => {
     }
 
     if (receiverSocketId) {
-      io.to(receiverSocketId).emit("receive-chat-request", { senderId, senderName });
+      // 💎 PREMIUM: Tag the request as 'Priority' if the sender is a premium account
+      io.to(receiverSocketId).emit("receive-chat-request", {
+        senderId,
+        senderName,
+        isPriority: userCheck?.isPremium || false
+      });
       socket.emit("request-sent-success");
       console.log(`✅ Request delivered to ${receiverId}`);
     } else {
@@ -998,11 +1070,15 @@ io.on("connection", (socket) => {
 
     // 💰 MONETIZATION: Enforce 3-times-per-day limit for 'Go Free' status visibility
     try {
-      const user = await db.collection("users").findOne({ sessionId: id });
-      if (user && !user.isPremium) {
+      userCheck = await db.collection("users").findOne({ sessionId: id });
+
+      // 💎 PREMIUM: Bypass daily toggle limits for premium accounts
+      const isPremium = userCheck?.isPremium || false;
+
+      if (!isPremium) {
         const today = new Date().toDateString();
-        if (user.lastGoFreeDate === today) {
-          if (user.goFreeToday >= 3) {
+        if (userCheck && userCheck.lastGoFreeDate === today) {
+          if ((userCheck.goFreeToday || 0) >= 3) {
             socket.emit("limit-reached", {
               type: "STATUS_TOGGLE",
               message: "You've shared your vibe 3 times today! Upgrade to Premium for unlimited visibility."
@@ -1018,7 +1094,6 @@ io.on("connection", (socket) => {
     const today = new Date().toDateString();
 
     // 🛡️ CRITICAL FIX: Handle 'Go Free' count resets without operator conflicts
-    const userCheck = await db.collection("users").findOne({ sessionId: id });
     const isNewDay = !userCheck || userCheck.lastGoFreeDate !== today;
 
     const updateDoc = isNewDay
@@ -1045,6 +1120,7 @@ io.on("connection", (socket) => {
           sessionId: id,
           name,
           status,
+          isPremium: userCheck?.isPremium || false, // 💎 PREMIUM: Pass status to global lobby
           socketId: socket.id,
           createdAt: new Date()
         }
