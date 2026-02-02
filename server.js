@@ -116,26 +116,29 @@ cron.schedule(
       console.error("❌ Cron Error:", err);
     }
   },
-  { timezone: "Asia/Kolkata" }
 );
 
+// ♻️ MONETIZATION: Dedicated Midnight Reset for User Usage Counters
 cron.schedule(
-  "0 0 1 * *",
+  "0 0 * * *",
   async () => {
     try {
-      console.log("🗓️ Monthly Reset Cron Running");
+      console.log("� [CRON] Global Midnight Usage Reset Running...");
       if (!db) return;
 
-      await db.collection("globalstats").updateOne(
-        { type: "monthly" },
-        { $set: { count: 0 } },
-        { upsert: true }
+      // Reset all free user counts to 0. Premium users effectively have 0 too.
+      await db.collection("users").updateMany(
+        {},
+        { $set: { requestsToday: 0, goFreeToday: 0 } }
       );
 
-      io.emit("month-reset", { count: 0 });
-      console.log("✅ Monthly stats reset to zero");
+
+      // Broadcast update to all connected users so their UI resets to 5/3 instantly
+      io.emit("usage-update", { requestsToday: 0, goFreeToday: 0 });
+
+      console.log("✅ [CRON] Midnight Usage Reset Completed Successfully");
     } catch (err) {
-      console.error("❌ Monthly Cron Error:", err);
+      console.error("❌ [CRON] Midnight Reset Error:", err);
     }
   },
   { timezone: "Asia/Kolkata" }
@@ -224,6 +227,38 @@ async function broadcastActiveUsers() {
       createdAt: u.createdAt
     }))
   );
+}
+
+// 💰 MONETIZATION: Helper to send current usage stats to ALL sessions/tabs of a specific user
+async function sendUsageUpdate(sessionId, socket) {
+  if (!db) return;
+  try {
+    const user = await db.collection("users").findOne({ sessionId });
+    if (user) {
+      const today = new Date().toDateString();
+      const requestsToday = user.lastRequestDate === today ? (user.requestsToday || 0) : 0;
+      const goFreeToday = user.lastGoFreeDate === today ? (user.goFreeToday || 0) : 0;
+
+      console.log(`📊 [USAGE-STATS] Session: ${sessionId} | Raw DB Requests: ${user.requestsToday} | Raw DB Toggles: ${user.goFreeToday} | LastPing: ${user.lastRequestDate} | LastFree: ${user.lastGoFreeDate} | Today: ${today}`);
+      console.log(`📊 [USAGE-CALC] Session: ${sessionId} | RequestsLeft: ${5 - requestsToday} | TogglesLeft: ${3 - goFreeToday} | Premium: ${!!user.isPremium}`);
+
+      const usageData = {
+        requestsToday,
+        goFreeToday,
+        isPremium: !!user.isPremium
+      };
+
+      // Emit to specific socket if provided, OR to all sockets in the user's private room
+      if (socket) {
+        socket.emit("usage-update", usageData);
+      }
+      io.to(`user_${sessionId}`).emit("usage-update", usageData);
+
+      console.log(`📊 [USAGE] Sent update to ${sessionId}:`, usageData);
+    }
+  } catch (err) {
+    console.error("❌ sendUsageUpdate Error:", err);
+  }
 }
 
 /* =======================
@@ -417,6 +452,47 @@ app.post("/api/admin/users/:email/reset-stats", async (req, res) => {
   }
 });
 
+// 💎 ADMIN: Toggle Premium status for a user to bypass daily limits
+app.post("/api/admin/users/:email/premium", async (req, res) => {
+  if (!db) return res.status(500).json({ error: "DB not ready" });
+  try {
+    const user = await db.collection("users").findOne({ email: req.params.email });
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const newPremiumStatus = !user.isPremium;
+    await db.collection("users").updateOne(
+      { email: req.params.email },
+      { $set: { isPremium: newPremiumStatus } }
+    );
+
+    console.log(`💎 Admin toggled premium for ${req.params.email}: ${newPremiumStatus}`);
+    res.json({ success: true, isPremium: newPremiumStatus });
+
+    // Notify the user via socket if they are online to update their UI
+    io.emit("admin-premium-toggle", { email: req.params.email, isPremium: newPremiumStatus });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ♻️ ADMIN: Manually reset a user's daily usage counters
+app.post("/api/admin/users/:email/reset-daily-limits", async (req, res) => {
+  if (!db) return res.status(500).json({ error: "DB not ready" });
+  try {
+    await db.collection("users").updateOne(
+      { email: req.params.email },
+      { $set: { requestsToday: 0, goFreeToday: 0 } }
+    );
+
+    console.log(`♻️ Admin reset daily usage for ${req.params.email}`);
+    res.json({ success: true });
+
+    io.emit("admin-usage-reset", { email: req.params.email });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/api/feedback", async (req, res) => {
   const { name, email, message } = req.body;
   if (!db) return res.status(500).json({ error: "DB not ready" });
@@ -542,7 +618,11 @@ io.on("connection", (socket) => {
 
     socket.sessionId = sessionId;
     userSockets.set(sessionId, socket.id);
-    console.log(`✅ User registered: ${sessionId} -> ${socket.id}`);
+
+    // Join a private room for this user session to sync multiple tabs
+    socket.join(`user_${sessionId}`);
+
+    console.log(`✅ User registered: ${sessionId} -> ${socket.id} (Joined user_${sessionId})`);
 
     // Session Recovery & Grace Period Cleanup
     if (pendingDisconnects.has(sessionId)) {
@@ -558,19 +638,66 @@ io.on("connection", (socket) => {
       socket.senderName = partnerName; // This is actually the user's name as saved on their socket
       console.log(`🔗 ${sessionId} rejoined room ${roomId}`);
     }
+
+    // 💰 MONETIZATION: Send initial usage stats on registration
+    sendUsageUpdate(sessionId, socket);
+  });
+
+  socket.on("usage-refresh", (sessionId) => {
+    sendUsageUpdate(sessionId, socket);
   });
 
   socket.on("send-chat-request", async ({ senderId, senderName, receiverId, receiverName, senderVibe }) => {
     const receiverSocketId = userSockets.get(receiverId);
     console.log(`📤 Chat request from ${senderName} (${senderId}) to ${receiverName || 'someone'} (${receiverId})`);
 
-    // Track stats
+    // 💰 MONETIZATION: Check if non-premium user has exceeded 5 daily chat requests
     if (db) {
       try {
+        const user = await db.collection("users").findOne({ sessionId: senderId });
+        if (user && !user.isPremium) {
+          const today = new Date().toDateString();
+          if (user.lastRequestDate === today) {
+            if (user.requestsToday >= 5) {
+              socket.emit("request-failed", {
+                message: "Daily limit reached (5 requests). Upgrade to Premium for unlimited vibing!",
+                limitReached: true
+              });
+              return;
+            }
+          }
+        }
+      } catch (err) {
+        console.error("❌ Limit check error:", err);
+      }
+    }
+
+    // 📊 USER METRICS: Increment total and daily request counters for analytics and limits
+    if (db) {
+      try {
+        const today = new Date().toDateString();
+
+        // 🛡️ CRITICAL FIX: Check if we need to reset count (new day) or increment (same day)
+        // This avoids the MongoDB "$set and $inc on the same field" error
+        const userCheck = await db.collection("users").findOne({ sessionId: senderId });
+        const isNewDay = !userCheck || userCheck.lastRequestDate !== today;
+
+        const updateDoc = isNewDay
+          ? { $set: { totalRequests: (userCheck?.totalRequests || 0) + 1, requestsToday: 1, lastRequestDate: today } }
+          : { $inc: { totalRequests: 1, requestsToday: 1 }, $set: { lastRequestDate: today } };
+
+        console.log(`📡 [PING] User: ${senderId} | isNewDay: ${isNewDay} | updateDoc:`, JSON.stringify(updateDoc));
+
         const sender = await db.collection("users").findOneAndUpdate(
           { sessionId: senderId },
-          { $inc: { totalRequests: 1 } }
+          updateDoc,
+          { returnDocument: 'after', upsert: true }
         );
+
+        console.log(`📡 [PING-SUCCESS] User: ${senderId} | NewCount: ${sender?.requestsToday || sender?.value?.requestsToday || 1}`);
+
+        // 💰 MONETIZATION: Emit updated counts to the sender
+        sendUsageUpdate(senderId, socket);
 
         const userDoc = sender?.value || (sender?.ok ? sender : null);
         if (userDoc && userDoc.email) {
@@ -794,7 +921,14 @@ io.on("connection", (socket) => {
     const game = activeVibeGames.get(roomId);
     if (!game) return;
 
-    const sId = socket.sessionId || sessionId; // Use socket's own session if possible
+    const sId = socket.sessionId || sessionId;
+
+    // 🛡️ TURN ENFORCEMENT: Only allow selection if it is this user's turn
+    if (sId !== game.turnId) {
+      console.log(`🚫 [VIBE] Blocked selection from ${sId} (Current Turn: ${game.turnId})`);
+      return;
+    }
+
     game.selections[sId] = emoji;
 
     // Broadcast that someone selected (but not what they selected)
@@ -813,8 +947,11 @@ io.on("connection", (socket) => {
       // Prepare next round
       game.round += 1;
       game.selections = {};
-      // Flip turn
-      game.turnId = game.turnId === game.participantIds[0] ? game.participantIds[1] : game.participantIds[0];
+
+      // Start next round with the user who picked LAST (alternate flow)
+      // Turn is already flipped by the key check below if it was Step 1
+      // but here we just ensure a consistent state for Round 2
+      game.turnId = sId;
 
       setTimeout(() => {
         if (game.round > 5) {
@@ -824,6 +961,10 @@ io.on("connection", (socket) => {
           io.to(roomId).emit("vibe-game-state", game);
         }
       }, 3000); // 3 second delay to show result
+    } else {
+      // First person picked: switch turn to the other person for Step 2 of the logic
+      game.turnId = game.participantIds.find(id => id !== sId);
+      io.to(roomId).emit("vibe-game-state", game);
     }
   });
 
@@ -855,10 +996,47 @@ io.on("connection", (socket) => {
   socket.on("go-free", async ({ id, name, status }) => {
     if (!db) return;
 
+    // 💰 MONETIZATION: Enforce 3-times-per-day limit for 'Go Free' status visibility
+    try {
+      const user = await db.collection("users").findOne({ sessionId: id });
+      if (user && !user.isPremium) {
+        const today = new Date().toDateString();
+        if (user.lastGoFreeDate === today) {
+          if (user.goFreeToday >= 3) {
+            socket.emit("limit-reached", {
+              type: "STATUS_TOGGLE",
+              message: "You've shared your vibe 3 times today! Upgrade to Premium for unlimited visibility."
+            });
+            return;
+          }
+        }
+      }
+    } catch (err) {
+      console.error("❌ Status limit check error:", err);
+    }
+
+    const today = new Date().toDateString();
+
+    // 🛡️ CRITICAL FIX: Handle 'Go Free' count resets without operator conflicts
+    const userCheck = await db.collection("users").findOne({ sessionId: id });
+    const isNewDay = !userCheck || userCheck.lastGoFreeDate !== today;
+
+    const updateDoc = isNewDay
+      ? { $set: { isFree: true, socketId: socket.id, status, lastGoFreeDate: today, goFreeToday: 1 } }
+      : { $set: { isFree: true, socketId: socket.id, status, lastGoFreeDate: today }, $inc: { goFreeToday: 1 } };
+
+    console.log(`🌐 [GO-FREE] User: ${id} | isNewDay: ${isNewDay} | updateDoc:`, JSON.stringify(updateDoc));
+
     await db.collection("users").updateOne(
       { sessionId: id },
-      { $set: { isFree: true, socketId: socket.id, status } }
+      updateDoc,
+      { upsert: true }
     );
+
+    console.log(`🌐 [GO-FREE-SUCCESS] User: ${id} | Toggled Visibility`);
+
+    // 💰 MONETIZATION: Update local count after toggle
+    sendUsageUpdate(id, socket);
 
     await db.collection("activeusers").updateOne(
       { sessionId: id },
@@ -873,6 +1051,22 @@ io.on("connection", (socket) => {
       },
       { upsert: true }
     );
+
+    // 📊 USER METRICS: Log visibility toggle to activity history
+    try {
+      const userDoc = await db.collection("users").findOne({ sessionId: id });
+      if (userDoc && userDoc.email) {
+        await db.collection("activitylogs").insertOne({
+          userEmail: userDoc.email,
+          type: 'STATUS_TOGGLE',
+          detail: `Shared vibe visibility: "${status}"`,
+          timestamp: new Date(),
+          isActive: true
+        });
+      }
+    } catch (err) {
+      console.error("❌ Visibility log error:", err);
+    }
 
     broadcastActiveUsers();
   });
