@@ -69,6 +69,7 @@ const client = new MongoClient(process.env.MONGO_URI, {
   family: 4 // Force IPv4 to avoid some DNS SRV resolution issues
 });
 let db;
+let globalConfig = { eliteEnabled: true, pingLimit: 5, toggleLimit: 3 };
 
 async function initDB(retries = 3) {
   for (let i = 0; i < retries; i++) {
@@ -77,6 +78,25 @@ async function initDB(retries = 3) {
       await client.connect();
       db = client.db("freeNow");
       console.log("✅ MongoDB Connected");
+
+      // 🛡️ GLOBAL CONFIG: Initialize default settings if they don't exist
+      const config = await db.collection("appConfig").findOne({ type: "global" });
+      if (!config) {
+        console.log("📝 Initializing global app configuration...");
+        const defaultConfig = {
+          type: "global",
+          eliteEnabled: true,
+          pingLimit: 5,
+          toggleLimit: 3,
+          updatedAt: new Date()
+        };
+        await db.collection("appConfig").insertOne(defaultConfig);
+        globalConfig = { eliteEnabled: defaultConfig.eliteEnabled, pingLimit: defaultConfig.pingLimit, toggleLimit: defaultConfig.toggleLimit };
+      } else {
+        globalConfig = { eliteEnabled: config.eliteEnabled, pingLimit: config.pingLimit, toggleLimit: config.toggleLimit };
+      }
+      console.log("📝 Global Config Loaded:", globalConfig);
+
       return true;
     } catch (err) {
       console.error(`❌ MongoDB Connection Attempt ${i + 1} Failed:`, err.message);
@@ -123,18 +143,28 @@ cron.schedule(
   "0 0 * * *",
   async () => {
     try {
-      console.log("� [CRON] Global Midnight Usage Reset Running...");
+      console.log("🕛 [CRON] Global Midnight Usage Reset Running...");
       if (!db) return;
 
-      // Reset all free user counts to 0. Premium users effectively have 0 too.
-      await db.collection("users").updateMany(
+      // Reset all user counts to 0. 
+      // IMPORTANT: We do NOT wipe isPremium, premiumUntil, or sessionId here.
+      const result = await db.collection("users").updateMany(
         {},
         { $set: { requestsToday: 0, goFreeToday: 0 } }
       );
 
+      console.log(`✅ [CRON] Reset counters for ${result.modifiedCount} users.`);
 
-      // Broadcast update to all connected users so their UI resets to 5/3 instantly
-      io.emit("usage-update", { requestsToday: 0, goFreeToday: 0 });
+      // Update last reset date in config
+      const now = new Date();
+      const todayStr = now.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+      await db.collection("appConfig").updateOne(
+        { type: "global" },
+        { $set: { lastGlobalResetDate: todayStr, updatedAt: new Date() } }
+      );
+
+      // Notify all connected clients to trigger a fresh usage recovery
+      io.emit("midnight-vibe-reset");
 
       console.log("✅ [CRON] Midnight Usage Reset Completed Successfully");
     } catch (err) {
@@ -225,6 +255,7 @@ async function broadcastActiveUsers() {
       name: u.name,
       status: u.status,
       isPremium: u.isPremium || false, // 💎 PREMIUM: Include for UI rings/badges
+      gender: u.gender || "none", // 🚻 GENDER: Elite filtering
       createdAt: u.createdAt
     }))
   );
@@ -247,7 +278,12 @@ async function sendUsageUpdate(sessionId, socket) {
         requestsToday,
         goFreeToday,
         isPremium: !!user.isPremium,
-        premiumUntil: user.premiumUntil || null
+        premiumUntil: user.premiumUntil || null,
+        globalConfig: {
+          eliteEnabled: globalConfig.eliteEnabled,
+          pingLimit: globalConfig.pingLimit,
+          toggleLimit: globalConfig.toggleLimit
+        }
       };
 
       // Emit to specific socket if provided, OR to all sockets in the user's private room
@@ -278,6 +314,7 @@ app.get("/api/activeusers", async (req, res) => {
     name: u.name,
     status: u.status,
     isPremium: u.isPremium || false, // 💎 PREMIUM: Include for UI rings/badges
+    gender: u.gender || "none", // 🚻 GENDER: Elite filtering
     createdAt: u.createdAt
   })));
 });
@@ -290,7 +327,7 @@ app.post("/api/sync-user", async (req, res) => {
     await db.collection("users").updateOne(
       { email },
       {
-        $set: { sessionId, name, lastSeen: new Date() },
+        $set: { sessionId, name, lastSeen: new Date(), gender: req.body.gender || "none" },
         $setOnInsert: {
           totalRequests: 0,
           matchesMade: 0,
@@ -352,6 +389,8 @@ app.get("/api/user-stats/:email", async (req, res) => {
   res.json({
     totalRequests: user?.totalRequests || 0,
     matchesMade: user?.matchesMade || 0,
+    isPremium: user?.isPremium || false,
+    gender: user?.gender || "none",
     isSuspended: user?.isSuspended || false,
     systemWarning: user?.systemWarning || null,
     needsUnsuspendAcknowledge: user?.needsUnsuspendAcknowledge || false
@@ -619,6 +658,57 @@ app.delete("/api/admin/users/:email", async (req, res) => {
   }
 });
 
+// 🛡️ ADMIN: Global App Configuration
+app.get("/api/admin/config", async (req, res) => {
+  if (!db) return res.status(500).json({ error: "DB not ready" });
+  try {
+    const config = await db.collection("appConfig").findOne({ type: "global" });
+    res.json(config);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/admin/config", async (req, res) => {
+  if (!db) return res.status(500).json({ error: "DB not ready" });
+  const { eliteEnabled, pingLimit, toggleLimit } = req.body;
+
+  try {
+    const updateDoc = {};
+    if (eliteEnabled !== undefined) updateDoc.eliteEnabled = eliteEnabled;
+    if (pingLimit !== undefined) updateDoc.pingLimit = parseInt(pingLimit);
+    if (toggleLimit !== undefined) updateDoc.toggleLimit = parseInt(toggleLimit);
+
+    await db.collection("appConfig").updateOne(
+      { type: "global" },
+      {
+        $set: {
+          ...updateDoc,
+          updatedAt: new Date()
+        }
+      }
+    );
+
+    // Update cache
+    const newConfig = await db.collection("appConfig").findOne({ type: "global" });
+    globalConfig = {
+      eliteEnabled: newConfig.eliteEnabled,
+      pingLimit: newConfig.pingLimit,
+      toggleLimit: newConfig.toggleLimit
+    };
+
+    console.log("📝 Global config updated:", globalConfig);
+
+    // Broadcast update to all clients
+    io.emit("config-update", globalConfig);
+
+    res.json({ success: true, config: globalConfig });
+  } catch (err) {
+    console.error("❌ Config update error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/api/admin/feedback", async (req, res) => {
   if (!db) return res.status(500).json({ error: "DB not ready" });
   try {
@@ -722,16 +812,16 @@ io.on("connection", (socket) => {
       try {
         userCheck = await db.collection("users").findOne({ sessionId: senderId });
 
-        // 💎 PREMIUM: Bypass daily ping limits for premium accounts
-        const isPremium = userCheck?.isPremium || false;
+        // 💎 PREMIUM: Bypass daily ping limits for premium accounts IF Elite is enabled
+        const isPremium = (userCheck?.isPremium && globalConfig.eliteEnabled) || false;
 
         if (!isPremium) {
           const today = new Date().toDateString();
           if (userCheck && userCheck.lastRequestDate === today) {
-            if ((userCheck.requestsToday || 0) >= 5) {
-              console.log(`🚫 [LIMIT] User ${senderId} hit ping limit`);
+            if ((userCheck.requestsToday || 0) >= globalConfig.pingLimit) {
+              console.log(`🚫 [LIMIT] User ${senderId} hit ping limit (${globalConfig.pingLimit})`);
               socket.emit("request-failed", {
-                message: "Daily limit reached (5 requests). Upgrade to Premium for unlimited vibing!",
+                message: `Daily limit reached (${globalConfig.pingLimit} requests). ${globalConfig.eliteEnabled ? 'Upgrade to Premium for unlimited vibing!' : ''}`,
                 limitReached: true
               });
               return;
@@ -743,27 +833,32 @@ io.on("connection", (socket) => {
       }
     }
 
-    // 📊 USER METRICS: Increment total and daily request counters
+    // 📊 USER METRICS: Increment total and daily request counters (Atomic & Tab-Safe)
     if (db) {
       try {
         const today = new Date().toDateString();
-        const isNewDay = !userCheck || userCheck.lastRequestDate !== today;
 
-        const updateDoc = isNewDay
-          ? { $set: { totalRequests: (userCheck?.totalRequests || 0) + 1, requestsToday: 1, lastRequestDate: today } }
-          : { $inc: { totalRequests: 1, requestsToday: 1 }, $set: { lastRequestDate: today } };
-
-        console.log(`📡 [PING] User: ${senderId} | isNewDay: ${isNewDay} | updateDoc:`, JSON.stringify(updateDoc));
-
-        const senderResult = await db.collection("users").findOneAndUpdate(
-          { sessionId: senderId },
-          updateDoc,
-          { returnDocument: 'after', upsert: true }
+        // Attempt atomic increment for the SAME day
+        let senderResult = await db.collection("users").findOneAndUpdate(
+          { sessionId: senderId, lastRequestDate: today },
+          { $inc: { totalRequests: 1, requestsToday: 1 } },
+          { returnDocument: 'after' }
         );
 
-        // Standardize the result regardless of MongoDB driver version
-        const updatedUser = senderResult?.value || senderResult;
+        // If result is null, it's either a new day or a new user
+        if (!senderResult || (!senderResult.value && !senderResult.sessionId)) {
+          console.log(`🌅 [PING-NEW-DAY] Resetting daily counter for ${senderId}`);
+          senderResult = await db.collection("users").findOneAndUpdate(
+            { sessionId: senderId },
+            {
+              $set: { requestsToday: 1, lastRequestDate: today },
+              $inc: { totalRequests: 1 }
+            },
+            { returnDocument: 'after', upsert: true }
+          );
+        }
 
+        const updatedUser = senderResult?.value || senderResult;
         console.log(`📡 [PING-SUCCESS] User: ${senderId} | NewCount: ${updatedUser?.requestsToday || 1}`);
 
         // 💰 MONETIZATION: Emit updated counts to the sender
@@ -785,11 +880,11 @@ io.on("connection", (socket) => {
     }
 
     if (receiverSocketId) {
-      // 💎 PREMIUM: Tag the request as 'Priority' if the sender is a premium account
+      // 💎 PREMIUM: Tag the request as 'Priority' if the sender is a premium account AND elite is enabled
       io.to(receiverSocketId).emit("receive-chat-request", {
         senderId,
         senderName,
-        isPriority: userCheck?.isPremium || false
+        isPriority: (userCheck?.isPremium && globalConfig.eliteEnabled) || false
       });
       socket.emit("request-sent-success");
       console.log(`✅ Request delivered to ${receiverId}`);
@@ -1072,16 +1167,16 @@ io.on("connection", (socket) => {
     try {
       userCheck = await db.collection("users").findOne({ sessionId: id });
 
-      // 💎 PREMIUM: Bypass daily toggle limits for premium accounts
-      const isPremium = userCheck?.isPremium || false;
+      // 💎 PREMIUM: Bypass daily toggle limits for premium accounts IF Elite is enabled
+      const isPremium = (userCheck?.isPremium && globalConfig.eliteEnabled) || false;
 
       if (!isPremium) {
         const today = new Date().toDateString();
         if (userCheck && userCheck.lastGoFreeDate === today) {
-          if ((userCheck.goFreeToday || 0) >= 3) {
+          if ((userCheck.goFreeToday || 0) >= globalConfig.toggleLimit) {
             socket.emit("limit-reached", {
               type: "STATUS_TOGGLE",
-              message: "You've shared your vibe 3 times today! Upgrade to Premium for unlimited visibility."
+              message: `You've shared your vibe ${globalConfig.toggleLimit} times today! ${globalConfig.eliteEnabled ? 'Upgrade to Premium for unlimited visibility.' : ''}`
             });
             return;
           }
@@ -1093,20 +1188,23 @@ io.on("connection", (socket) => {
 
     const today = new Date().toDateString();
 
-    // 🛡️ CRITICAL FIX: Handle 'Go Free' count resets without operator conflicts
-    const isNewDay = !userCheck || userCheck.lastGoFreeDate !== today;
-
-    const updateDoc = isNewDay
-      ? { $set: { isFree: true, socketId: socket.id, status, lastGoFreeDate: today, goFreeToday: 1 } }
-      : { $set: { isFree: true, socketId: socket.id, status, lastGoFreeDate: today }, $inc: { goFreeToday: 1 } };
-
-    console.log(`🌐 [GO-FREE] User: ${id} | isNewDay: ${isNewDay} | updateDoc:`, JSON.stringify(updateDoc));
-
-    await db.collection("users").updateOne(
-      { sessionId: id },
-      updateDoc,
-      { upsert: true }
+    // 🛡️ ATOMIC GO-FREE COUNTER: Multi-tab safe increment
+    let toggleResult = await db.collection("users").findOneAndUpdate(
+      { sessionId: id, lastGoFreeDate: today },
+      { $inc: { goFreeToday: 1 }, $set: { isFree: true, socketId: socket.id, status } },
+      { returnDocument: 'after' }
     );
+
+    if (!toggleResult || (!toggleResult.value && !toggleResult.sessionId)) {
+      console.log(`🌅 [GO-FREE-NEW-DAY] Resetting visibility counter for ${id}`);
+      toggleResult = await db.collection("users").findOneAndUpdate(
+        { sessionId: id },
+        {
+          $set: { goFreeToday: 1, lastGoFreeDate: today, isFree: true, socketId: socket.id, status }
+        },
+        { returnDocument: 'after', upsert: true }
+      );
+    }
 
     console.log(`🌐 [GO-FREE-SUCCESS] User: ${id} | Toggled Visibility`);
 
@@ -1121,6 +1219,7 @@ io.on("connection", (socket) => {
           name,
           status,
           isPremium: userCheck?.isPremium || false, // 💎 PREMIUM: Pass status to global lobby
+          gender: userCheck?.gender || "none", // 🚻 GENDER: Elite filtering
           socketId: socket.id,
           createdAt: new Date()
         }
@@ -1219,6 +1318,31 @@ initDB().then(async (success) => {
 
   // Perform startup checks/rotations
   await rotateDailyStatsIfNeeded();
+
+  // ♻️ STARTUP USAGE RESET: Check if we missed a reset while offline
+  try {
+    const now = new Date();
+    const todayStr = now.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+    const config = await db.collection("appConfig").findOne({ type: "global" });
+
+    if (config?.lastGlobalResetDate !== todayStr) {
+      console.log(`🔄 [STARTUP] Monthly/Daily reset needed. Last reset: ${config?.lastGlobalResetDate || 'Never'}`);
+
+      const result = await db.collection("users").updateMany(
+        {},
+        { $set: { requestsToday: 0, goFreeToday: 0 } }
+      );
+
+      await db.collection("appConfig").updateOne(
+        { type: "global" },
+        { $set: { lastGlobalResetDate: todayStr, updatedAt: new Date() } }
+      );
+
+      console.log(`✅ [STARTUP] Missed reset completed for ${result.modifiedCount} users.`);
+    }
+  } catch (err) {
+    console.error("❌ Failed startup usage reset check:", err);
+  }
 
   // 🧹 CLEAR STALE ACTIVE USERS ON STARTUP
   try {
