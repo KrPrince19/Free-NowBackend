@@ -1,6 +1,14 @@
 console.log("🔥 RUNNING FILE:", __filename);
 
-require("dotenv").config();
+const dotenvResult = require("dotenv").config();
+if (dotenvResult.error) {
+  console.error("❌ Dotenv Error:", dotenvResult.error);
+} else {
+  console.log("✅ Dotenv Loaded Successfully");
+}
+
+console.log("📡 DEBUG - RAZORPAY_KEY_ID:", process.env.RAZORPAY_KEY_ID ? `${process.env.RAZORPAY_KEY_ID.substring(0, 10)}...` : "UNDEFINED");
+console.log("📡 DEBUG - MONGO_URI exists:", !!process.env.MONGO_URI);
 
 const express = require("express");
 const http = require("http");
@@ -8,6 +16,8 @@ const { Server } = require("socket.io");
 const { MongoClient, ObjectId } = require("mongodb");
 const cors = require("cors");
 const cron = require("node-cron");
+const Razorpay = require("razorpay");
+const crypto = require("crypto");
 
 const SERVER_VERSION = "6.0-ULTIMATE";
 console.log("🛠️ SERVER VERSION:", SERVER_VERSION);
@@ -70,6 +80,21 @@ const client = new MongoClient(process.env.MONGO_URI, {
 });
 let db;
 let globalConfig = { eliteEnabled: true, pingLimit: 5, toggleLimit: 3 };
+
+// 💳 RAZORPAY INITIALIZATION
+const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID;
+const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
+
+if (!RAZORPAY_KEY_ID || RAZORPAY_KEY_ID === 'rzp_test_your_id') {
+  console.warn("⚠️ RAZORPAY_KEY_ID is missing or using placeholder! Payments will fail.");
+} else {
+  console.log(`✅ Razorpay Key Loaded: ${RAZORPAY_KEY_ID.substring(0, 8)}...`);
+}
+
+const razorpay = new Razorpay({
+  key_id: RAZORPAY_KEY_ID || 'rzp_test_your_id',
+  key_secret: RAZORPAY_KEY_SECRET || 'your_secret',
+});
 
 async function initDB(retries = 3) {
   for (let i = 0; i < retries; i++) {
@@ -634,6 +659,16 @@ app.get("/api/history/:email", async (req, res) => {
 /* =======================
    ADMIN API (SECURE)
 ======================= */
+app.get("/api/activeusers", async (req, res) => {
+  if (!db) return res.status(500).json({ error: "DB not ready" });
+  try {
+    const users = await db.collection("activeusers").find({}).toArray();
+    res.json(users);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/api/admin/users", async (req, res) => {
   if (!db) return res.status(500).json({ error: "DB not ready" });
   try {
@@ -641,6 +676,87 @@ app.get("/api/admin/users", async (req, res) => {
     res.json(users);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+/* =======================
+   💳 RAZORPAY PAYMENT ROUTES
+======================= */
+
+// 1. Create Order
+app.post("/api/payment/create-order", async (req, res) => {
+  try {
+    const options = {
+      amount: 9900, // ₹99.00 in paise
+      currency: "INR",
+      receipt: `receipt_${Date.now()}`,
+    };
+
+    const order = await razorpay.orders.create(options);
+    console.log("💳 [RAZORPAY] Order Created:", order.id);
+    res.json(order);
+  } catch (err) {
+    console.error("❌ [RAZORPAY] Order Error (Exhaustive):", {
+      status: err.statusCode,
+      message: err.message || "No message found",
+      error: err.error, // Razorpay often nests error details here
+      full: err
+    });
+
+    // Log the actual raw error for deep debugging
+    if (err.error && err.error.description) {
+      console.error("❌ [RAZORPAY] Description:", err.error.description);
+    }
+
+    res.status(500).json({
+      error: "Failed to create order",
+      details: err.error?.description || err.message || "Unknown Razorpay Error",
+      code: err.error?.code || err.code
+    });
+  }
+});
+
+// 2. Verify Payment
+app.post("/api/payment/verify", async (req, res) => {
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature, email, sessionId } = req.body;
+
+  if (!db) return res.status(500).json({ error: "DB not ready" });
+
+  try {
+    const sign = razorpay_order_id + "|" + razorpay_payment_id;
+    const expectedSign = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET || "your_secret")
+      .update(sign.toString())
+      .digest("hex");
+
+    if (razorpay_signature === expectedSign) {
+      console.log(`✅ [RAZORPAY] Payment Verified for ${email || sessionId}`);
+
+      // 🔓 UNLOCK ELITE STATUS
+      const updateData = {
+        isPremium: true,
+        premiumUntil: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // 30 Days
+      };
+
+      await db.collection("users").updateOne(
+        { $or: [{ email }, { sessionId }] },
+        { $set: updateData }
+      );
+
+      // Instant UI Update
+      if (sessionId) {
+        sendUsageUpdate(sessionId);
+        broadcastActiveUsers();
+      }
+
+      return res.json({ success: true, message: "Payment verified successfully" });
+    } else {
+      console.error("❌ [RAZORPAY] Signature Verification Failed");
+      return res.status(400).json({ error: "Invalid payment signature" });
+    }
+  } catch (err) {
+    console.error("❌ [RAZORPAY] Verification Error:", err);
+    res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
