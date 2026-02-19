@@ -7,7 +7,7 @@ if (dotenvResult.error) {
   console.log("✅ Dotenv Loaded Successfully");
 }
 
-console.log("📡 DEBUG - RAZORPAY_KEY_ID:", process.env.RAZORPAY_KEY_ID ? `${process.env.RAZORPAY_KEY_ID.substring(0, 10)}...` : "UNDEFINED");
+// Razorpay debug removed
 console.log("📡 DEBUG - MONGO_URI exists:", !!process.env.MONGO_URI);
 
 const express = require("express");
@@ -16,7 +16,6 @@ const { Server } = require("socket.io");
 const { MongoClient, ObjectId } = require("mongodb");
 const cors = require("cors");
 const cron = require("node-cron");
-const Razorpay = require("razorpay");
 const crypto = require("crypto");
 
 const SERVER_VERSION = "6.0-ULTIMATE";
@@ -79,22 +78,9 @@ const client = new MongoClient(process.env.MONGO_URI, {
   family: 4 // Force IPv4 to avoid some DNS SRV resolution issues
 });
 let db;
-let globalConfig = { eliteEnabled: true, pingLimit: 5, toggleLimit: 3 };
+let globalConfig = { pingLimit: 5, toggleLimit: 3 };
 
-// 💳 RAZORPAY INITIALIZATION
-const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID;
-const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
-
-if (!RAZORPAY_KEY_ID || RAZORPAY_KEY_ID === 'rzp_test_your_id') {
-  console.warn("⚠️ RAZORPAY_KEY_ID is missing or using placeholder! Payments will fail.");
-} else {
-  console.log(`✅ Razorpay Key Loaded: ${RAZORPAY_KEY_ID.substring(0, 8)}...`);
-}
-
-const razorpay = new Razorpay({
-  key_id: RAZORPAY_KEY_ID || 'rzp_test_your_id',
-  key_secret: RAZORPAY_KEY_SECRET || 'your_secret',
-});
+// DB initialization logic
 
 async function initDB(retries = 3) {
   for (let i = 0; i < retries; i++) {
@@ -110,15 +96,14 @@ async function initDB(retries = 3) {
         console.log("📝 Initializing global app configuration...");
         const defaultConfig = {
           type: "global",
-          eliteEnabled: true,
           pingLimit: 5,
           toggleLimit: 3,
           updatedAt: new Date()
         };
         await db.collection("appConfig").insertOne(defaultConfig);
-        globalConfig = { eliteEnabled: defaultConfig.eliteEnabled, pingLimit: defaultConfig.pingLimit, toggleLimit: defaultConfig.toggleLimit };
+        globalConfig = { pingLimit: defaultConfig.pingLimit, toggleLimit: defaultConfig.toggleLimit };
       } else {
-        globalConfig = { eliteEnabled: config.eliteEnabled, pingLimit: config.pingLimit, toggleLimit: config.toggleLimit };
+        globalConfig = { pingLimit: config.pingLimit, toggleLimit: config.toggleLimit };
       }
       console.log("📝 Global Config Loaded:", globalConfig);
 
@@ -171,8 +156,7 @@ cron.schedule(
       console.log("🕛 [CRON] Global Midnight Usage Reset Running...");
       if (!db) return;
 
-      // Reset all user counts to 0. 
-      // IMPORTANT: We do NOT wipe isPremium, premiumUntil, or sessionId here.
+      // Reset all user counts to 0.
       const result = await db.collection("users").updateMany(
         {},
         { $set: { requestsToday: 0, goFreeToday: 0 } }
@@ -279,14 +263,13 @@ async function broadcastActiveUsers() {
       id: u.sessionId,
       name: u.name,
       status: u.status,
-      isPremium: u.isPremium || false, // 💎 PREMIUM: Include for UI rings/badges
-      gender: u.gender || "none", // 🚻 GENDER: Elite filtering
+      gender: u.gender || "none", // 🚻 GENDER: filtering
       createdAt: u.createdAt
     }))
   );
 }
 
-// 💰 MONETIZATION: Helper to send current usage stats to ALL sessions/tabs of a specific user
+// Helper to send current usage stats to ALL sessions/tabs of a specific user
 async function sendUsageUpdate(sessionId, socket) {
   if (!db) return;
   try {
@@ -297,15 +280,12 @@ async function sendUsageUpdate(sessionId, socket) {
       const goFreeToday = user.lastGoFreeDate === today ? (user.goFreeToday || 0) : 0;
 
       console.log(`📊 [USAGE-STATS] Session: ${sessionId} | Raw DB Requests: ${user.requestsToday} | Raw DB Toggles: ${user.goFreeToday} | LastPing: ${user.lastRequestDate} | LastFree: ${user.lastGoFreeDate} | Today: ${today}`);
-      console.log(`📊 [USAGE-CALC] Session: ${sessionId} | RequestsLeft: ${5 - requestsToday} | TogglesLeft: ${3 - goFreeToday} | Premium: ${!!user.isPremium}`);
+      console.log(`📊 [USAGE-CALC] Session: ${sessionId} | RequestsLeft: ${5 - requestsToday} | TogglesLeft: ${3 - goFreeToday}`);
 
       const usageData = {
         requestsToday,
         goFreeToday,
-        isPremium: !!user.isPremium,
-        premiumUntil: user.premiumUntil || null,
         globalConfig: {
-          eliteEnabled: globalConfig.eliteEnabled,
           pingLimit: globalConfig.pingLimit,
           toggleLimit: globalConfig.toggleLimit
         }
@@ -338,8 +318,6 @@ app.get("/api/activeusers", async (req, res) => {
     id: u.sessionId,
     name: u.name,
     status: u.status,
-    isPremium: u.isPremium || false, // 💎 PREMIUM: Include for UI rings/badges
-    gender: u.gender || "none", // 🚻 GENDER: Elite filtering
     createdAt: u.createdAt
   })));
 });
@@ -352,7 +330,11 @@ app.post("/api/sync-user", async (req, res) => {
     await db.collection("users").updateOne(
       { email },
       {
-        $set: { sessionId, name, lastSeen: new Date(), gender: req.body.gender || "none" },
+        $set: {
+          sessionId,
+          name,
+          lastSeen: new Date()
+        },
         $setOnInsert: {
           totalRequests: 0,
           matchesMade: 0,
@@ -414,7 +396,6 @@ app.get("/api/user-stats/:email", async (req, res) => {
   res.json({
     totalRequests: user?.totalRequests || 0,
     matchesMade: user?.matchesMade || 0,
-    isPremium: user?.isPremium || false,
     gender: user?.gender || "none",
     isSuspended: user?.isSuspended || false,
     systemWarning: user?.systemWarning || null,
@@ -519,85 +500,7 @@ app.post("/api/admin/users/:email/reset-stats", async (req, res) => {
   }
 });
 
-// 💎 ADMIN: Toggle Premium status for a user to bypass daily limits
-app.post("/api/admin/users/:email/premium", async (req, res) => {
-  if (!db) return res.status(500).json({ error: "DB not ready" });
-  try {
-    const user = await db.collection("users").findOne({ email: req.params.email });
-    if (!user) return res.status(404).json({ error: "User not found" });
-
-    const newPremiumStatus = !user.isPremium;
-    await db.collection("users").updateOne(
-      { email: req.params.email },
-      { $set: { isPremium: newPremiumStatus } }
-    );
-
-    console.log(`💎 Admin toggled premium for ${req.params.email}: ${newPremiumStatus}`);
-
-    // 💰 REAL-TIME SYNC: Update lobby and notify user immediately
-    // 1. Update the active lobby directly (if user is online/free)
-    const lobbyUpdate = await db.collection("activeusers").updateOne(
-      { sessionId: user.sessionId },
-      { $set: { isPremium: newPremiumStatus } }
-    );
-    if (lobbyUpdate.modifiedCount > 0) {
-      console.log(`✅ [LOBBY-SYNC] Updated premium status for ${req.params.email} in active lobby`);
-      broadcastActiveUsers();
-    }
-
-    // 2. Notify the user's tab(s) directly via their sessionId room
-    if (user.sessionId) {
-      console.log(`📡 [SESSION-SYNC] Sending usage-update to user_${user.sessionId}`);
-      sendUsageUpdate(user.sessionId);
-    }
-
-    // 3. Global notification as backup for StatusContext listener
-    io.emit("admin-premium-toggle", { email: req.params.email, isPremium: newPremiumStatus });
-
-    res.json({ success: true, isPremium: newPremiumStatus });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 💰 MOCK PAYMENT: Simulates a successful checkout for testing
-app.post("/api/mock-payment-success", async (req, res) => {
-  if (!db) return res.status(500).json({ error: "DB not ready" });
-  try {
-    const { email, sessionId } = req.body;
-    if (!email || !sessionId) return res.status(400).json({ error: "Missing email or sessionId" });
-
-    console.log(`💰 [MOCK-PAYMENT] Simulating success for: ${email}`);
-
-    // Calculate Expiry: 30 Days from now
-    const expiryDate = new Date();
-    expiryDate.setDate(expiryDate.getDate() + 30);
-
-    // 1. Update Persistent Database
-    await db.collection("users").updateOne(
-      { email },
-      { $set: { isPremium: true, premiumUntil: expiryDate } }
-    );
-
-    // 2. Update Active Lobby Cache
-    await db.collection("activeusers").updateOne(
-      { sessionId },
-      { $set: { isPremium: true } }
-    );
-
-    // 3. Real-Time Triple Sync
-    broadcastActiveUsers(); // Show 👑 to everyone
-    sendUsageUpdate(sessionId); // Show 👑 to user tabs
-
-    // Global toggle event as backup
-    io.emit("admin-premium-toggle", { email, isPremium: true, premiumUntil: expiryDate });
-
-    res.json({ success: true, message: "Welcome to Elite Status! 👑", premiumUntil: expiryDate });
-  } catch (err) {
-    console.error("❌ Mock Payment Error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
+// API paths
 
 // ♻️ ADMIN: Manually reset a user's daily usage counters
 app.post("/api/admin/users/:email/reset-daily-limits", async (req, res) => {
@@ -679,86 +582,7 @@ app.get("/api/admin/users", async (req, res) => {
   }
 });
 
-/* =======================
-   💳 RAZORPAY PAYMENT ROUTES
-======================= */
-
-// 1. Create Order
-app.post("/api/payment/create-order", async (req, res) => {
-  try {
-    const options = {
-      amount: 9900, // ₹99.00 in paise
-      currency: "INR",
-      receipt: `receipt_${Date.now()}`,
-    };
-
-    const order = await razorpay.orders.create(options);
-    console.log("💳 [RAZORPAY] Order Created:", order.id);
-    res.json(order);
-  } catch (err) {
-    console.error("❌ [RAZORPAY] Order Error (Exhaustive):", {
-      status: err.statusCode,
-      message: err.message || "No message found",
-      error: err.error, // Razorpay often nests error details here
-      full: err
-    });
-
-    // Log the actual raw error for deep debugging
-    if (err.error && err.error.description) {
-      console.error("❌ [RAZORPAY] Description:", err.error.description);
-    }
-
-    res.status(500).json({
-      error: "Failed to create order",
-      details: err.error?.description || err.message || "Unknown Razorpay Error",
-      code: err.error?.code || err.code
-    });
-  }
-});
-
-// 2. Verify Payment
-app.post("/api/payment/verify", async (req, res) => {
-  const { razorpay_order_id, razorpay_payment_id, razorpay_signature, email, sessionId } = req.body;
-
-  if (!db) return res.status(500).json({ error: "DB not ready" });
-
-  try {
-    const sign = razorpay_order_id + "|" + razorpay_payment_id;
-    const expectedSign = crypto
-      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET || "your_secret")
-      .update(sign.toString())
-      .digest("hex");
-
-    if (razorpay_signature === expectedSign) {
-      console.log(`✅ [RAZORPAY] Payment Verified for ${email || sessionId}`);
-
-      // 🔓 UNLOCK ELITE STATUS
-      const updateData = {
-        isPremium: true,
-        premiumUntil: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // 30 Days
-      };
-
-      await db.collection("users").updateOne(
-        { $or: [{ email }, { sessionId }] },
-        { $set: updateData }
-      );
-
-      // Instant UI Update
-      if (sessionId) {
-        sendUsageUpdate(sessionId);
-        broadcastActiveUsers();
-      }
-
-      return res.json({ success: true, message: "Payment verified successfully" });
-    } else {
-      console.error("❌ [RAZORPAY] Signature Verification Failed");
-      return res.status(400).json({ error: "Invalid payment signature" });
-    }
-  } catch (err) {
-    console.error("❌ [RAZORPAY] Verification Error:", err);
-    res.status(500).json({ error: "Internal Server Error" });
-  }
-});
+// End of API routes
 
 app.delete("/api/admin/users/:email", async (req, res) => {
   if (!db) return res.status(500).json({ error: "DB not ready" });
@@ -787,40 +611,29 @@ app.get("/api/admin/config", async (req, res) => {
 
 app.post("/api/admin/config", async (req, res) => {
   if (!db) return res.status(500).json({ error: "DB not ready" });
-  const { eliteEnabled, pingLimit, toggleLimit } = req.body;
+  const { pingLimit, toggleLimit } = req.body;
 
   try {
     const updateDoc = {};
-    if (eliteEnabled !== undefined) updateDoc.eliteEnabled = eliteEnabled;
     if (pingLimit !== undefined) updateDoc.pingLimit = parseInt(pingLimit);
     if (toggleLimit !== undefined) updateDoc.toggleLimit = parseInt(toggleLimit);
 
     await db.collection("appConfig").updateOne(
       { type: "global" },
       {
-        $set: {
-          ...updateDoc,
-          updatedAt: new Date()
-        }
+        $set: { ...updateDoc, updatedAt: new Date() }
       }
     );
 
-    // Update cache
-    const newConfig = await db.collection("appConfig").findOne({ type: "global" });
-    globalConfig = {
-      eliteEnabled: newConfig.eliteEnabled,
-      pingLimit: newConfig.pingLimit,
-      toggleLimit: newConfig.toggleLimit
-    };
+    // Update local config
+    if (pingLimit !== undefined) globalConfig.pingLimit = parseInt(pingLimit);
+    if (toggleLimit !== undefined) globalConfig.toggleLimit = parseInt(toggleLimit);
 
-    console.log("📝 Global config updated:", globalConfig);
-
-    // Broadcast update to all clients
     io.emit("config-update", globalConfig);
 
+    console.log("🛡️ Admin updated global config:", globalConfig);
     res.json({ success: true, config: globalConfig });
   } catch (err) {
-    console.error("❌ Config update error:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -910,7 +723,7 @@ io.on("connection", (socket) => {
       console.log(`🔗 ${sessionId} rejoined room ${roomId}`);
     }
 
-    // 💰 MONETIZATION: Send initial usage stats on registration
+    // Send initial usage stats on registration
     sendUsageUpdate(sessionId, socket);
   });
 
@@ -922,26 +735,20 @@ io.on("connection", (socket) => {
     const receiverSocketId = userSockets.get(receiverId);
     console.log(`📤 Chat request from ${senderName} (${senderId}) to ${receiverName || 'someone'} (${receiverId})`);
 
-    // 💰 MONETIZATION: Universal limit and priority check
-    let userCheck = null;
+    // 🛡️ LIMIT CHECK
     if (db) {
       try {
         userCheck = await db.collection("users").findOne({ sessionId: senderId });
 
-        // 💎 PREMIUM: Bypass daily ping limits for premium accounts IF Elite is enabled
-        const isPremium = (userCheck?.isPremium && globalConfig.eliteEnabled) || false;
-
-        if (!isPremium) {
-          const today = new Date().toDateString();
-          if (userCheck && userCheck.lastRequestDate === today) {
-            if ((userCheck.requestsToday || 0) >= globalConfig.pingLimit) {
-              console.log(`🚫 [LIMIT] User ${senderId} hit ping limit (${globalConfig.pingLimit})`);
-              socket.emit("request-failed", {
-                message: `Daily limit reached (${globalConfig.pingLimit} requests). ${globalConfig.eliteEnabled ? 'Upgrade to Premium for unlimited vibing!' : ''}`,
-                limitReached: true
-              });
-              return;
-            }
+        const today = new Date().toDateString();
+        if (userCheck && userCheck.lastRequestDate === today) {
+          if ((userCheck.requestsToday || 0) >= globalConfig.pingLimit) {
+            console.log(`🚫 [LIMIT] User ${senderId} hit ping limit (${globalConfig.pingLimit})`);
+            socket.emit("request-failed", {
+              message: `Daily limit reached (${globalConfig.pingLimit} requests).`,
+              limitReached: true
+            });
+            return;
           }
         }
       } catch (err) {
@@ -977,7 +784,7 @@ io.on("connection", (socket) => {
         const updatedUser = senderResult?.value || senderResult;
         console.log(`📡 [PING-SUCCESS] User: ${senderId} | NewCount: ${updatedUser?.requestsToday || 1}`);
 
-        // 💰 MONETIZATION: Emit updated counts to the sender
+        // 📊 Emit updated counts to the sender
         sendUsageUpdate(senderId, socket);
 
         if (updatedUser && updatedUser.email) {
@@ -996,11 +803,10 @@ io.on("connection", (socket) => {
     }
 
     if (receiverSocketId) {
-      // 💎 PREMIUM: Tag the request as 'Priority' if the sender is a premium account AND elite is enabled
       io.to(receiverSocketId).emit("receive-chat-request", {
         senderId,
         senderName,
-        isPriority: (userCheck?.isPremium && globalConfig.eliteEnabled) || false
+        isPriority: false
       });
       socket.emit("request-sent-success");
       console.log(`✅ Request delivered to ${receiverId}`);
@@ -1154,6 +960,7 @@ io.on("connection", (socket) => {
     }
 
     socket.to(roomId).emit("partner-left", { senderName });
+    io.to(roomId).emit("session-ended", { roomId }); // End the session for both
     socket.leave(roomId);
     activeRooms.delete(roomId);
 
@@ -1279,23 +1086,18 @@ io.on("connection", (socket) => {
   socket.on("go-free", async ({ id, name, status }) => {
     if (!db) return;
 
-    // 💰 MONETIZATION: Enforce 3-times-per-day limit for 'Go Free' status visibility
+    // 🛡️ STATUS LIMIT CHECK
     try {
       userCheck = await db.collection("users").findOne({ sessionId: id });
 
-      // 💎 PREMIUM: Bypass daily toggle limits for premium accounts IF Elite is enabled
-      const isPremium = (userCheck?.isPremium && globalConfig.eliteEnabled) || false;
-
-      if (!isPremium) {
-        const today = new Date().toDateString();
-        if (userCheck && userCheck.lastGoFreeDate === today) {
-          if ((userCheck.goFreeToday || 0) >= globalConfig.toggleLimit) {
-            socket.emit("limit-reached", {
-              type: "STATUS_TOGGLE",
-              message: `You've shared your vibe ${globalConfig.toggleLimit} times today! ${globalConfig.eliteEnabled ? 'Upgrade to Premium for unlimited visibility.' : ''}`
-            });
-            return;
-          }
+      const today = new Date().toDateString();
+      if (userCheck && userCheck.lastGoFreeDate === today) {
+        if ((userCheck.goFreeToday || 0) >= globalConfig.toggleLimit) {
+          socket.emit("limit-reached", {
+            type: "STATUS_TOGGLE",
+            message: `You've shared your vibe ${globalConfig.toggleLimit} times today!`
+          });
+          return;
         }
       }
     } catch (err) {
@@ -1324,7 +1126,7 @@ io.on("connection", (socket) => {
 
     console.log(`🌐 [GO-FREE-SUCCESS] User: ${id} | Toggled Visibility`);
 
-    // 💰 MONETIZATION: Update local count after toggle
+    // 📊 Update local count after toggle
     sendUsageUpdate(id, socket);
 
     await db.collection("activeusers").updateOne(
@@ -1334,8 +1136,6 @@ io.on("connection", (socket) => {
           sessionId: id,
           name,
           status,
-          isPremium: userCheck?.isPremium || false, // 💎 PREMIUM: Pass status to global lobby
-          gender: userCheck?.gender || "none", // 🚻 GENDER: Elite filtering
           socketId: socket.id,
           createdAt: new Date()
         }
@@ -1403,6 +1203,7 @@ io.on("connection", (socket) => {
           }
         }
         socket.to(socket.currentRoom).emit("partner-left", { senderName: socket.senderName });
+        io.to(socket.currentRoom).emit("session-ended", { roomId: socket.currentRoom });
         activeRooms.delete(socket.currentRoom);
         io.emit("conversation-ended", { roomId: socket.currentRoom });
       }
