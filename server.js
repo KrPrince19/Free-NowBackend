@@ -184,6 +184,45 @@ cron.schedule(
 );
 
 /* =======================
+   MONTHLY RESET CRON (1st of every Month IST)
+======================= */
+cron.schedule(
+  "0 0 1 * *",
+  async () => {
+    try {
+      console.log("📅 [CRON] Monthly Connection Reset Running...");
+      if (!db) return;
+
+      // 1. Reset the monthly connection counter in Global Stats
+      await db.collection("globalstats").updateOne(
+        { type: "monthly" },
+        { $set: { count: 0, updatedAt: new Date() } },
+        { upsert: true }
+      );
+
+      // 2. Update config to track that this month's reset was done
+      const now = new Date();
+      const currentMonth = now.getMonth(); // 0-11
+      const currentYear = now.getFullYear();
+      const monthKey = `${currentYear}-${currentMonth + 1}`; // e.g. "2024-3"
+
+      await db.collection("appConfig").updateOne(
+        { type: "global" },
+        { $set: { lastMonthlyReset: monthKey, updatedAt: new Date() } }
+      );
+
+      // 3. Notify frontend to refresh counters (reset to 0 visually)
+      io.emit("month-reset", { message: "New month started! Stats cleared." });
+
+      console.log(`✅ [CRON] Monthly Reset Completed for ${monthKey}`);
+    } catch (err) {
+      console.error("❌ [CRON] Monthly Reset Error:", err);
+    }
+  },
+  { timezone: "Asia/Kolkata" }
+);
+
+/* =======================
    HELPERS
 ======================= */
 async function rotateDailyStatsIfNeeded() {
@@ -1256,6 +1295,28 @@ initDB().then(async (success) => {
       );
 
       console.log(`✅ [STARTUP] Missed reset completed for ${result.modifiedCount} users.`);
+    }
+
+    // ♻️ STARTUP MONTHLY RESET: Check if we missed a monthly reset while offline
+    const currentMonth = now.getMonth();
+    const currentYear = now.getFullYear();
+    const monthKey = `${currentYear}-${currentMonth + 1}`;
+
+    if (config?.lastMonthlyReset !== monthKey) {
+      console.log(`🔄 [STARTUP] Monthly Connection Reset needed. Last reset: ${config?.lastMonthlyReset || 'Never'}`);
+
+      await db.collection("globalstats").updateOne(
+        { type: "monthly" },
+        { $set: { count: 0, updatedAt: new Date() } },
+        { upsert: true }
+      );
+
+      await db.collection("appConfig").updateOne(
+        { type: "global" },
+        { $set: { lastMonthlyReset: monthKey, updatedAt: new Date() } }
+      );
+
+      console.log(`✅ [STARTUP] Missed Monthly reset completed for ${monthKey}`);
     }
   } catch (err) {
     console.error("❌ Failed startup usage reset check:", err);
