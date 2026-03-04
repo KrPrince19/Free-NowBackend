@@ -903,8 +903,8 @@ io.on("connection", (socket) => {
       });
 
       // Persistent session data
-      userRooms.set(senderId, { roomId, partnerName: senderName });
-      userRooms.set(receiverId, { roomId, partnerName: receiverName });
+      userRooms.set(senderId, { roomId, partnerName: receiverName });
+      userRooms.set(receiverId, { roomId, partnerName: senderName });
 
       // Remove from active users once connected (they are no longer "available" or "online" in the general pool)
       if (db) {
@@ -967,10 +967,11 @@ io.on("connection", (socket) => {
       clientId: clientId,
       text: message,
       sender: senderName,
+      senderId: socket.sessionId, // Added senderId for robust frontend deduplication
       type: type || 'text',
       timestamp: timestamp.toISOString()
     };
-    console.log(`💬 [V:${SERVER_VERSION}][Room ${roomId}] Msg from ${senderName}: ${type || 'text'} (ID: ${msg.id}, ClientId: ${clientId || 'UNDEFINED'})`);
+    console.log(`💬 [V:${SERVER_VERSION}][Room ${roomId}] Msg from ${senderName} (${socket.sessionId}): ${type || 'text'} (ID: ${msg.id})`);
     io.to(roomId).emit("new-message", msg);
   });
 
