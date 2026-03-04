@@ -1332,5 +1332,6 @@ initDB().then(async (success) => {
 
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`🚀 Server running on http://localhost:${PORT}`);
+    console.log("✅ [SYNC] Global Stats & Dashboard Theme Fixes Active");
   });
 });
